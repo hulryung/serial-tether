@@ -1,0 +1,37 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/tether-protocol",
+    "crates/tetherd",
+    "crates/tether",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/hulryung/serial-tether"
+
+[workspace.dependencies]
+tether-protocol = { path = "crates/tether-protocol" }
+
+tokio = { version = "1.40", features = ["full"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+tokio-serial = "5.4"
+futures = "0.3"
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+uuid = { version = "1", features = ["v7"] }
+regex = "1"
+
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+bytes = "1"
+parking_lot = "0.12"

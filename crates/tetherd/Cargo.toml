@@ -1,0 +1,32 @@
+[package]
+name = "tetherd"
+description = "Serial Tether — daemon that owns a serial port and exposes it to multiple clients (humans + agents)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "tetherd"
+path = "src/main.rs"
+
+[dependencies]
+tether-protocol = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tokio-serial = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+base64 = { workspace = true }
+uuid = { workspace = true }
+regex = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+parking_lot = { workspace = true }
+bytes = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
