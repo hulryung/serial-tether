@@ -733,7 +733,7 @@ dependencies = [
 
 [[package]]
 name = "tether"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -751,7 +751,7 @@ dependencies = [
 
 [[package]]
 name = "tether-protocol"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64",
  "bytes",
@@ -765,7 +765,7 @@ dependencies = [
 
 [[package]]
 name = "tetherd"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "base64",
