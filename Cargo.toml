@@ -35,3 +35,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 bytes = "1"
 parking_lot = "0.12"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
