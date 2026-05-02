@@ -11,18 +11,44 @@
 - **`tether-protocol`** — wire-protocol types and NDJSON codec (shared library used by both daemon and client).
 - **`tether-tui`** *(planned)* — interactive TUI client for human use.
 
+## Install (macOS / Linux)
+
+Pick whichever you prefer — every option installs both `tetherd` and `tether`.
+
+**Homebrew** (recommended on macOS — no Rust toolchain needed):
+```sh
+brew install hulryung/tether/tetherd hulryung/tether/tether
+```
+
+**`cargo install`** (with a Rust toolchain — works on any platform Rust supports):
+```sh
+cargo install --git https://github.com/hulryung/serial-tether --tag v0.2.1 tetherd tether
+```
+
+**Pre-built binaries via curl** (no dependencies):
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/hulryung/serial-tether/releases/download/v0.2.1/tetherd-installer.sh | sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/hulryung/serial-tether/releases/download/v0.2.1/tether-installer.sh | sh
+```
+
+Or **build from source**:
+```sh
+git clone https://github.com/hulryung/serial-tether
+cd serial-tether
+cargo build --workspace --release
+# binaries land in ./target/release/{tetherd,tether}
+```
+
 ## Quick start
 
 ```sh
-cargo build --workspace --release
-
 # Terminal 1 — daemon owns the port
-./target/release/tetherd -D /dev/tty.usbserial-XXXX -b 115200
+tetherd -D /dev/tty.usbserial-XXXX -b 115200
 
 # Terminal 2 — agent / scripted CLI
-./target/release/tether status
-./target/release/tether run "version" -u "# " --literal --timeout-ms 3000 --json
-./target/release/tether tail
+tether status
+tether run "version" -u "# " --literal --timeout-ms 3000 --json
+tether tail
 ```
 
 ## The one command an agent should reach for
