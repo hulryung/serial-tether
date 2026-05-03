@@ -656,6 +656,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "serial-tether"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "bytes",
+ "clap",
+ "futures",
+ "libc",
+ "parking_lot",
+ "regex",
+ "serde",
+ "serde_json",
+ "tether-protocol",
+ "thiserror",
+ "tokio",
+ "tokio-serial",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "serialport"
 version = "4.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -732,26 +756,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "tether"
-version = "0.2.1"
-dependencies = [
- "anyhow",
- "base64",
- "bytes",
- "clap",
- "futures",
- "serde",
- "serde_json",
- "tether-protocol",
- "tokio",
- "tokio-util",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "tether-protocol"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "base64",
  "bytes",
@@ -761,30 +767,6 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-util",
-]
-
-[[package]]
-name = "tetherd"
-version = "0.2.1"
-dependencies = [
- "anyhow",
- "base64",
- "bytes",
- "clap",
- "futures",
- "libc",
- "parking_lot",
- "regex",
- "serde",
- "serde_json",
- "tether-protocol",
- "thiserror",
- "tokio",
- "tokio-serial",
- "tokio-util",
- "tracing",
- "tracing-subscriber",
- "uuid",
 ]
 
 [[package]]

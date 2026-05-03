@@ -6,29 +6,33 @@
 
 ## Components
 
+The `serial-tether` package ships two binaries:
+
 - **`tetherd`** — daemon. Owns the serial port; fans a single ring buffer out to every attached session.
 - **`tether`** — non-interactive CLI. `send` / `expect` / `run` / `status` / `tail` / `sync`.
-- **`tether-protocol`** — wire-protocol types and NDJSON codec (shared library used by both daemon and client).
+
+Plus a supporting library:
+
+- **`tether-protocol`** — wire-protocol types and NDJSON codec (shared between daemon and client).
 - **`tether-tui`** *(planned)* — interactive TUI client for human use.
 
 ## Install (macOS / Linux)
 
-Pick whichever you prefer — every option installs both `tetherd` and `tether`.
+Every option below installs both `tetherd` and `tether`. Pick the one you prefer.
 
 **Homebrew** (recommended on macOS — no Rust toolchain needed):
 ```sh
-brew install hulryung/tether/tetherd hulryung/tether/tether
+brew install hulryung/tether/serial-tether
 ```
 
 **`cargo install`** (with a Rust toolchain — works on any platform Rust supports):
 ```sh
-cargo install --git https://github.com/hulryung/serial-tether --tag v0.2.1 tetherd tether
+cargo install --git https://github.com/hulryung/serial-tether --tag v0.3.0 serial-tether
 ```
 
 **Pre-built binaries via curl** (no dependencies):
 ```sh
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/hulryung/serial-tether/releases/download/v0.2.1/tetherd-installer.sh | sh
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/hulryung/serial-tether/releases/download/v0.2.1/tether-installer.sh | sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/hulryung/serial-tether/releases/download/v0.3.0/serial-tether-installer.sh | sh
 ```
 
 Or **build from source**:

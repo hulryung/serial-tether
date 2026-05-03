@@ -1,6 +1,6 @@
 [package]
-name = "tetherd"
-description = "Serial Tether — daemon that owns a serial port and exposes it to multiple clients (humans + agents)"
+name = "serial-tether"
+description = "Serial Tether — daemon and CLI for sharing a serial device with humans and AI agents"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,8 +8,12 @@ repository.workspace = true
 homepage.workspace = true
 
 [[bin]]
+name = "tether"
+path = "src/bin/tether.rs"
+
+[[bin]]
 name = "tetherd"
-path = "src/main.rs"
+path = "src/bin/tetherd/main.rs"
 
 [dependencies]
 tether-protocol = { workspace = true }
