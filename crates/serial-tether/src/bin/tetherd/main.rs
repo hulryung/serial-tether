@@ -175,10 +175,27 @@ async fn main() -> Result<()> {
     };
 
     let buffer = RingBuffer::new(args.buffer_capacity);
-    let port = SerialPort::open(&cfg)
-        .await
-        .with_context(|| format!("opening serial {}", args.device))?;
-    let (writer, _serial_task) = serial::spawn(port, buffer.clone());
+
+    // Verify the device opens at startup so we fail fast on bad config / wrong
+    // path / permissions. The serial task will still own a fresh open after
+    // this, plus reconnect forever if the device disappears.
+    {
+        let port = SerialPort::open(&cfg)
+            .await
+            .with_context(|| format!("opening serial {}", args.device))?;
+        drop(port);
+    }
+
+    let device_state = Arc::new(parking_lot::Mutex::new(crate::state::DeviceState::new_disconnected()));
+    let force_reconnect = Arc::new(tokio::sync::Notify::new());
+    let reconnected = Arc::new(tokio::sync::Notify::new());
+    let (writer, _serial_task) = serial::spawn(
+        cfg.clone(),
+        buffer.clone(),
+        device_state.clone(),
+        force_reconnect.clone(),
+        reconnected.clone(),
+    );
 
     // Resolve the auth token. Generate one if --tcp is enabled without --auth-token.
     let auth_token: Option<Arc<String>> = if args.tcp.is_some() {
@@ -202,6 +219,9 @@ async fn main() -> Result<()> {
         config: cfg,
         lock: Arc::new(crate::state::WriterLock::default()),
         auth_token: auth_token.clone(),
+        device_state,
+        force_reconnect,
+        reconnected,
     };
 
     let mut listener_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();

@@ -1,21 +1,27 @@
-//! Serial-device abstraction.
+//! Serial-device abstraction with auto-reconnect.
 //!
-//! v0: a single task owns the device — reads push into the ring buffer,
-//! writes arrive on an mpsc channel.
+//! A single owner task wraps an "outer" reconnect loop around the per-session
+//! IO loop. On any disconnect (EOF, error, or an explicit `force_reconnect`
+//! signal) the task closes the device, fails any in-flight writes, then sleeps
+//! a short backoff and tries to reopen. The outer loop runs forever.
 //!
 //! Two backends:
 //! - `Real`: tokio-serial. Real serial ports that accept termios setup.
 //! - `Fd`: a plain fd wrapped with `O_NONBLOCK` + `AsyncFd`. Used for PTYs,
-//!   socat pairs, and other non-strict-termios devices. `tokio::fs::File`
-//!   is cancel-unsafe on PTYs, so we don't use it.
+//!   socat pairs, and other non-strict-termios devices. `tokio::fs::File` is
+//!   cancel-unsafe on PTYs, so we don't use it.
 
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use parking_lot::Mutex;
 use tokio::io::{unix::AsyncFd, AsyncReadExt, AsyncWriteExt, Interest};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 
 use crate::buffer::RingBuffer;
+use crate::state::DeviceState;
 
 #[derive(Debug, Clone)]
 pub struct SerialConfig {
@@ -90,8 +96,7 @@ impl FdPort {
 impl SerialPort {
     pub async fn open(cfg: &SerialConfig) -> Result<Self> {
         match tokio_serial::SerialStream::open(
-            &tokio_serial::new(&cfg.path, cfg.baud)
-                .timeout(std::time::Duration::from_millis(0)),
+            &tokio_serial::new(&cfg.path, cfg.baud).timeout(Duration::from_millis(0)),
         ) {
             Ok(s) => Ok(SerialPort::Real(s)),
             Err(e) => {
@@ -138,60 +143,160 @@ impl SerialWriter {
     }
 }
 
-/// Spawn the task that owns the serial device.
-pub fn spawn(port: SerialPort, buffer: RingBuffer) -> (SerialWriter, tokio::task::JoinHandle<()>) {
+/// Spawn the serial owner task. The task runs forever, reconnecting whenever
+/// the device disappears (EOF, error, or `force_reconnect`).
+///
+/// Returns the writer handle. Callers update `state` and trigger
+/// `force_reconnect` from the outside (e.g., the `reconnect` RPC).
+pub fn spawn(
+    cfg: SerialConfig,
+    buffer: RingBuffer,
+    state: Arc<Mutex<DeviceState>>,
+    force_reconnect: Arc<Notify>,
+    reconnected: Arc<Notify>,
+) -> (SerialWriter, tokio::task::JoinHandle<()>) {
     let (tx, mut rx) = mpsc::channel::<WriteJob>(64);
     let writer = SerialWriter { tx };
 
     let handle = tokio::spawn(async move {
-        match port {
-            SerialPort::Real(mut s) => {
-                let mut read_buf = [0u8; 4096];
-                loop {
-                    tokio::select! {
-                        biased;
-                        job = rx.recv() => {
-                            let Some(job) = job else { break };
-                            let WriteJob { data, ack } = job;
-                            let (head_before, _) = buffer.snapshot_seqs();
-                            let res = s.write_all(&data).await.map(|_| head_before);
-                            let _ = ack.send(res);
+        let initial_backoff = Duration::from_millis(500);
+        let max_backoff = Duration::from_secs(10);
+        let mut backoff = initial_backoff;
+
+        loop {
+            // Try to open the device. While in retry, drain pending write
+            // jobs immediately with a NotConnected error so clients don't wait.
+            let port = loop {
+                match SerialPort::open(&cfg).await {
+                    Ok(p) => {
+                        tracing::info!(path = %cfg.path, "serial opened");
+                        {
+                            let mut s = state.lock();
+                            s.connected = true;
+                            s.last_open_at = Some(Instant::now());
+                            s.last_disconnect_reason = None;
+                            s.consecutive_open_failures = 0;
                         }
-                        read = s.read(&mut read_buf) => {
-                            match read {
-                                Ok(0) => { tracing::warn!("serial EOF"); break; }
-                                Ok(n) => buffer.push(&read_buf[..n]),
-                                Err(e) => { tracing::error!(error=%e, "serial read error"); break; }
+                        reconnected.notify_waiters();
+                        backoff = initial_backoff;
+                        break p;
+                    }
+                    Err(e) => {
+                        let reason = format!("{e}");
+                        tracing::warn!(
+                            path = %cfg.path, error = %reason,
+                            backoff_ms = backoff.as_millis() as u64,
+                            "serial open failed; will retry"
+                        );
+                        {
+                            let mut s = state.lock();
+                            s.connected = false;
+                            s.last_disconnect_reason = Some(reason);
+                            s.consecutive_open_failures += 1;
+                        }
+                        // While waiting, fail any pending writes immediately
+                        // and react to a force_reconnect kick.
+                        let sleep = tokio::time::sleep(backoff);
+                        tokio::pin!(sleep);
+                        loop {
+                            tokio::select! {
+                                _ = &mut sleep => break,
+                                _ = force_reconnect.notified() => break,
+                                Some(job) = rx.recv() => {
+                                    let _ = job.ack.send(Err(std::io::Error::new(
+                                        std::io::ErrorKind::NotConnected,
+                                        "device disconnected",
+                                    )));
+                                }
                             }
                         }
+                        backoff = (backoff * 2).min(max_backoff);
+                        continue;
                     }
                 }
+            };
+
+            // Run one IO session with the open port. Returns a string reason
+            // explaining why we exited (EOF, write error, force, etc.).
+            let reason = run_io_session(port, &buffer, &mut rx, &force_reconnect).await;
+            tracing::warn!(reason = %reason, "serial session ended");
+            {
+                let mut s = state.lock();
+                s.connected = false;
+                s.last_disconnect_reason = Some(reason);
+                s.disconnect_count += 1;
             }
-            SerialPort::Fd(p) => {
-                let mut read_buf = [0u8; 4096];
-                loop {
-                    tokio::select! {
-                        biased;
-                        job = rx.recv() => {
-                            let Some(job) = job else { break };
-                            let WriteJob { data, ack } = job;
-                            let (head_before, _) = buffer.snapshot_seqs();
-                            let res = p.write_all(&data).await.map(|_| head_before);
-                            let _ = ack.send(res);
-                        }
-                        read = p.read(&mut read_buf) => {
-                            match read {
-                                Ok(0) => { tracing::warn!("serial EOF"); break; }
-                                Ok(n) => buffer.push(&read_buf[..n]),
-                                Err(e) => { tracing::error!(error=%e, "serial read error"); break; }
-                            }
-                        }
-                    }
-                }
-            }
+            // Brief gap before next reopen attempt so a flapping device
+            // doesn't pin a CPU.
+            tokio::time::sleep(Duration::from_millis(200)).await;
         }
     });
 
     (writer, handle)
 }
 
+/// Per-session IO loop. Returns when the device disconnects (or we're forced
+/// to reconnect). The string is a short reason for diagnostics.
+async fn run_io_session(
+    port: SerialPort,
+    buffer: &RingBuffer,
+    rx: &mut mpsc::Receiver<WriteJob>,
+    force_reconnect: &Notify,
+) -> String {
+    match port {
+        SerialPort::Real(mut s) => {
+            let mut read_buf = [0u8; 4096];
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = force_reconnect.notified() => return "forced reconnect".to_string(),
+                    job = rx.recv() => {
+                        let Some(job) = job else { return "writer channel closed".into() };
+                        let WriteJob { data, ack } = job;
+                        let (head_before, _) = buffer.snapshot_seqs();
+                        let res = s.write_all(&data).await.map(|_| head_before);
+                        let failed = res.is_err();
+                        let _ = ack.send(res);
+                        if failed {
+                            return "write error".to_string();
+                        }
+                    }
+                    read = s.read(&mut read_buf) => {
+                        match read {
+                            Ok(0) => return "EOF".to_string(),
+                            Ok(n) => buffer.push(&read_buf[..n]),
+                            Err(e) => return format!("read error: {e}"),
+                        }
+                    }
+                }
+            }
+        }
+        SerialPort::Fd(p) => {
+            let mut read_buf = [0u8; 4096];
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = force_reconnect.notified() => return "forced reconnect".to_string(),
+                    job = rx.recv() => {
+                        let Some(job) = job else { return "writer channel closed".into() };
+                        let WriteJob { data, ack } = job;
+                        let (head_before, _) = buffer.snapshot_seqs();
+                        let res = p.write_all(&data).await.map(|_| head_before);
+                        let failed = res.is_err();
+                        let _ = ack.send(res);
+                        if failed {
+                            return "write error".to_string();
+                        }
+                    }
+                    read = p.read(&mut read_buf) => {
+                        match read {
+                            Ok(0) => return "EOF".to_string(),
+                            Ok(n) => buffer.push(&read_buf[..n]),
+                            Err(e) => return format!("read error: {e}"),
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

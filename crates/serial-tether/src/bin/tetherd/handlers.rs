@@ -263,6 +263,7 @@ pub async fn status(
 ) -> Result<Value, ProtocolError> {
     let (head, tail) = state.buffer.snapshot_seqs();
     let holder = state.lock.holder.lock().clone();
+    let device_connected = state.device_state.lock().connected;
     let result = StatusResult {
         device: DeviceInfo {
             path: state.config.path.clone(),
@@ -270,7 +271,7 @@ pub async fn status(
             data_bits: 8,
             parity: "none".into(),
             stop_bits: 1,
-            connected: true,
+            connected: device_connected,
         },
         buffer: BufferInfo {
             capacity_bytes: state.buffer.capacity() as u64,
@@ -284,6 +285,68 @@ pub async fn status(
         sessions: state.sessions.snapshot(head),
     };
     Ok(serde_json::to_value(result).unwrap())
+}
+
+/// Force the daemon to drop the current device handle and reopen it.
+/// Useful when the serial bus is wedged (USB driver hang, board reset
+/// half-completed) and a `tether status` shows `connected:true` even though
+/// nothing is responding.
+///
+/// Params (all optional):
+///   `wait`: bool — block until the device is back open (default true)
+///   `timeout_ms`: u32 — how long to wait for reconnect (default 5000)
+///
+/// Result:
+///   `triggered: bool` — always true; we always notify the serial task.
+///   `reconnected: bool` — true if the device came back within the timeout.
+///   `device_connected: bool` — final device state on return.
+pub async fn reconnect(
+    state: &DaemonState,
+    _conn: &ConnState,
+    params: Option<Value>,
+) -> Result<Value, ProtocolError> {
+    #[derive(serde::Deserialize, Default)]
+    #[serde(default)]
+    struct Params {
+        #[serde(default = "default_wait")]
+        wait: bool,
+        #[serde(default = "default_timeout_ms")]
+        timeout_ms: u32,
+    }
+    fn default_wait() -> bool { true }
+    fn default_timeout_ms() -> u32 { 5000 }
+
+    let p: Params = match params {
+        Some(v) => serde_json::from_value(v)
+            .map_err(|e| err_with(ErrorCode::InvalidParams, e.to_string()))?,
+        None => Params { wait: true, timeout_ms: 5000 },
+    };
+
+    // Subscribe to the next "reconnected" pulse *before* we fire the kick,
+    // so we can't miss the signal even if the serial task is fast.
+    let waiter = state.reconnected.notified();
+    tokio::pin!(waiter);
+    state.force_reconnect.notify_waiters();
+
+    let mut reconnected_ok = false;
+    if p.wait {
+        let timeout = std::time::Duration::from_millis(p.timeout_ms as u64);
+        match tokio::time::timeout(timeout, waiter).await {
+            Ok(()) => reconnected_ok = true,
+            Err(_) => {
+                // Maybe device was already up before we even had to reconnect;
+                // double-check current state.
+                reconnected_ok = state.device_state.lock().connected;
+            }
+        }
+    }
+    let device_connected = state.device_state.lock().connected;
+
+    Ok(serde_json::json!({
+        "triggered": true,
+        "reconnected": reconnected_ok,
+        "device_connected": device_connected,
+    }))
 }
 
 // ---------- Internal helpers ----------

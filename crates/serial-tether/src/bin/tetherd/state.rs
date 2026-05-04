@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Instant;
 
 use parking_lot::Mutex;
 use tokio::sync::Notify;
@@ -6,6 +7,34 @@ use tokio::sync::Notify;
 use crate::buffer::RingBuffer;
 use crate::serial::{SerialConfig, SerialWriter};
 use crate::session::SessionManager;
+
+/// Liveness state of the underlying serial device. The serial task is the
+/// sole writer; other code reads it (for the `status` RPC, the banner, etc.).
+#[derive(Debug, Clone)]
+pub struct DeviceState {
+    /// True when the daemon currently holds the device open.
+    pub connected: bool,
+    /// Last successful open. None until the first open.
+    pub last_open_at: Option<Instant>,
+    /// Last disconnect/EOF/error reason. None while connected.
+    pub last_disconnect_reason: Option<String>,
+    /// Cumulative count of disconnects since daemon start (for diagnostics).
+    pub disconnect_count: u64,
+    /// Consecutive open failures during the current outage. Resets on success.
+    pub consecutive_open_failures: u64,
+}
+
+impl DeviceState {
+    pub fn new_disconnected() -> Self {
+        Self {
+            connected: false,
+            last_open_at: None,
+            last_disconnect_reason: None,
+            disconnect_count: 0,
+            consecutive_open_failures: 0,
+        }
+    }
+}
 
 /// Single writer lock used by `run` transactions.
 /// `holder == None` means the lock is free; `Some(id)` means session `id`
@@ -26,4 +55,13 @@ pub struct DaemonState {
     /// Required by clients connecting over a transport with `requires_auth=true`
     /// (i.e., TCP). `None` means TCP listening is disabled.
     pub auth_token: Option<Arc<String>>,
+    /// Live tracking of whether the serial device is currently open. The
+    /// serial task updates this; everyone else just reads.
+    pub device_state: Arc<Mutex<DeviceState>>,
+    /// Notify the serial task to drop the current device handle and reopen
+    /// (used by the `reconnect` RPC).
+    pub force_reconnect: Arc<Notify>,
+    /// Notify when device_state transitions to connected (used by `reconnect`
+    /// to wait for the reopen to complete).
+    pub reconnected: Arc<Notify>,
 }

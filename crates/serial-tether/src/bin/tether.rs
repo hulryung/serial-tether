@@ -121,6 +121,16 @@ enum Cmd {
         #[arg(long, default_value = "now", value_parser = ["start", "now"])]
         from: String,
     },
+    /// Tell the daemon to drop and reopen the serial device. Useful when
+    /// the bus is wedged but the daemon thinks it's still connected.
+    Reconnect {
+        /// Don't wait for the device to come back online.
+        #[arg(long)]
+        nowait: bool,
+        /// How long to wait for the device to reopen.
+        #[arg(long, default_value_t = 5000)]
+        timeout_ms: u32,
+    },
 }
 
 fn main() -> ExitCode {
@@ -386,6 +396,34 @@ where
             let session_id = attach(&mut framed, &mut next_id, &from).await?;
             shell_loop(framed, session_id).await?;
             return Ok(());
+        }
+        Cmd::Reconnect { nowait, timeout_ms } => {
+            let v = call(
+                &mut framed,
+                &mut next_id,
+                "reconnect",
+                json!({
+                    "wait": !nowait,
+                    "timeout_ms": timeout_ms,
+                }),
+            )
+            .await?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+            } else {
+                let reconnected = v.get("reconnected").and_then(|b| b.as_bool()).unwrap_or(false);
+                let connected = v.get("device_connected").and_then(|b| b.as_bool()).unwrap_or(false);
+                if connected {
+                    eprintln!("tether: device reopened");
+                } else if reconnected {
+                    eprintln!("tether: reconnect succeeded but device state is uncertain");
+                } else {
+                    eprintln!(
+                        "tether: reconnect requested but device is still disconnected after {timeout_ms}ms"
+                    );
+                    return Err(CliError::DeviceDisconnected);
+                }
+            }
         }
         Cmd::Sync { idle_ms, timeout_ms } => {
             let session_id = attach(&mut framed, &mut next_id, "now").await?;
