@@ -157,11 +157,12 @@ whatever the board accepts.
 
 ## Remote daemons (over a network)
 
-Native TCP transport with token auth shipped in v0.4.0:
+Native TCP transport with token auth (v0.4.0+; v0.5 lets you say just `--tcp`):
 
 ```sh
 # Daemon host (board operator):
-tetherd -D /dev/tty.usbserial-XXXX --tcp 0.0.0.0:5557 --auth-token MYSECRET
+tetherd -D /dev/tty.usbserial-XXXX --tcp --auth-token MYSECRET
+# (bare `--tcp` defaults to 0.0.0.0:5557; omit --auth-token to auto-generate)
 
 # Agent host (you):
 export TETHER_AUTH_TOKEN=MYSECRET

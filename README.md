@@ -35,7 +35,7 @@ cargo install serial-tether
 
 **Pre-built binaries via curl** (no dependencies):
 ```sh
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/hulryung/serial-tether/releases/download/v0.4.0/serial-tether-installer.sh | sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/hulryung/serial-tether/releases/download/v0.5.0/serial-tether-installer.sh | sh
 ```
 
 Or **build from source**:
@@ -52,11 +52,16 @@ cargo build --workspace --release
 # Terminal 1 — daemon owns the port (default: UDS at /tmp/tetherd.sock)
 tetherd -D /dev/tty.usbserial-XXXX -b 115200
 
-# Terminal 2 — agent / scripted CLI
+# Terminal 2 — drop into a tio-style interactive shell
+tether                                  # Ctrl-A then Q to quit
+
+# Or, for agents / scripts:
 tether status
 tether run "version" -u "# " --literal --timeout-ms 3000 --json
 tether tail
 ```
+
+If the daemon isn't running, `tether` prints exactly how to start it.
 
 ### Remote daemon (TCP)
 
@@ -65,9 +70,10 @@ with TCP listening:
 
 ```sh
 # On the daemon host:
-tetherd -D /dev/tty.usbserial-XXXX -b 115200 --tcp 0.0.0.0:5557 --auth-token MYSECRET
-
-# (or omit --auth-token to have one generated and printed at startup)
+tetherd -D /dev/tty.usbserial-XXXX -b 115200 --tcp
+# Banner prints the auto-generated token and every reachable IP. Pin the
+# token explicitly with --auth-token MYSECRET if you want it stable across
+# restarts. Use --tcp 127.0.0.1:5557 for loopback only.
 
 # On the agent host:
 TETHER_AUTH_TOKEN=MYSECRET tether -s tcp://daemon-host:5557 status
@@ -103,21 +109,25 @@ bash tools/smoke_test.sh
 
 ## Status
 
-Shipped through v0.4.0:
+Shipped through v0.5.0:
 - ✅ `hello` / `attach` / `detach` / `send` / `expect` / `run` / `status`
 - ✅ writer lock with `preempt` policy (queue / fail / force)
 - ✅ `strip_ansi` / `strip_echo` / `max_output_bytes` (with truncation marker)
 - ✅ standard exit codes; decoded `output` field in `--json`
 - ✅ `sync` (send CR, wait until idle, surface a prompt candidate)
 - ✅ ring-buffer fan-out with separate consumer / notify cursors per session
-- ✅ TCP transport with token auth (`--tcp HOST:PORT --auth-token …`)
+- ✅ TCP transport with token auth (`--tcp [HOST:PORT] --auth-token …`)
 - ✅ Single daemon can listen on UDS and TCP simultaneously
+- ✅ Startup banner enumerating reachable IPs and the auth token
+- ✅ `tether shell` — interactive raw-mode client (Ctrl-A then Q to quit)
+- ✅ `tether` (no subcommand) drops into the shell
+- ✅ Friendly error when the daemon isn't running (with the command to start one)
 
 Not yet:
 - Windows Named Pipe backend
-- `tether-tui` (interactive client with raw mode + escape sequences)
 - 30-second session resume after disconnect
 - `cancel` method
+- TLS for TCP (use SSH/WireGuard for untrusted networks for now)
 
 ## License
 
