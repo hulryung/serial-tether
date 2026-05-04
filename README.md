@@ -1,6 +1,6 @@
 # Serial Tether
 
-![Serial Tether — one serial port, one daemon, many clients](assets/og.png)
+![Serial Tether — share any serial port, anywhere](assets/banner.png)
 
 > A daemon and CLI that lets AI agents and humans share a single serial device.
 
