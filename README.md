@@ -30,7 +30,7 @@ brew install hulryung/tether/serial-tether
 
 **`cargo install`** (with a Rust toolchain — works on any platform Rust supports):
 ```sh
-cargo install --git https://github.com/hulryung/serial-tether --tag v0.4.0 serial-tether
+cargo install serial-tether
 ```
 
 **Pre-built binaries via curl** (no dependencies):
