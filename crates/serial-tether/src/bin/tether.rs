@@ -51,6 +51,9 @@ enum Cmd {
         /// Treat `data` as base64.
         #[arg(long)]
         base64: bool,
+        /// Append a line terminator to the data before sending.
+        #[arg(long, default_value = "none", value_parser = ["none", "lf", "cr", "crlf"])]
+        newline: String,
     },
     /// Wait until a pattern appears.
     Expect {
@@ -83,6 +86,10 @@ enum Cmd {
         /// Behaviour when the writer lock is contended.
         #[arg(long, default_value = "queue", value_parser = ["queue", "fail", "force"])]
         preempt: String,
+        /// Append a line terminator to the data before sending.
+        /// Most embedded shells (U-Boot, busybox, Linux login) want `crlf` or `lf`.
+        #[arg(long, default_value = "none", value_parser = ["none", "lf", "cr", "crlf"])]
+        newline: String,
     },
     /// Show daemon status.
     Status,
@@ -167,7 +174,7 @@ async fn run(cli: Cli) -> Result<(), CliError> {
             let v = call(&mut framed, &mut next_id, "status", json!({})).await?;
             print_json_or_pairs(&v, cli.json);
         }
-        Cmd::Send { data, base64: is_b64 } => {
+        Cmd::Send { data, base64: is_b64, newline } => {
             let session_id = attach(&mut framed, &mut next_id, "now").await?;
             let mut p = SendParams {
                 session_id: session_id.clone(),
@@ -178,7 +185,7 @@ async fn run(cli: Cli) -> Result<(), CliError> {
             if is_b64 {
                 p.data = Some(data);
             } else {
-                p.data_text = Some(data);
+                p.data_text = Some(apply_newline(data, &newline));
             }
             let v = call(&mut framed, &mut next_id, "send", serde_json::to_value(p).unwrap())
                 .await?;
@@ -194,7 +201,7 @@ async fn run(cli: Cli) -> Result<(), CliError> {
             let session_id = attach(&mut framed, &mut next_id, "now").await?;
             let p = ExpectParams {
                 session_id,
-                pattern,
+                pattern: pattern.clone(),
                 regex: !literal,
                 timeout_ms: Some(timeout_ms),
                 strip_ansi,
@@ -203,14 +210,23 @@ async fn run(cli: Cli) -> Result<(), CliError> {
                 max_bytes: None,
                 max_output_bytes: Some(max_output_bytes),
             };
-            let v = call(
+            match call(
                 &mut framed,
                 &mut next_id,
                 "expect",
                 serde_json::to_value(p).unwrap(),
             )
-            .await?;
-            print_match_result(&v, cli.json);
+            .await
+            {
+                Ok(v) => print_match_result(&v, cli.json),
+                Err(CliError::Timeout) => {
+                    eprintln!(
+                        "tether: timeout after {timeout_ms}ms waiting for {pattern:?}"
+                    );
+                    return Err(CliError::Timeout);
+                }
+                Err(e) => return Err(e),
+            }
         }
         Cmd::Run {
             data,
@@ -221,14 +237,15 @@ async fn run(cli: Cli) -> Result<(), CliError> {
             strip_echo,
             max_output_bytes,
             preempt,
+            newline,
         } => {
             let session_id = attach(&mut framed, &mut next_id, "now").await?;
             let p = RunParams {
                 session_id,
                 data: None,
-                data_text: Some(data),
+                data_text: Some(apply_newline(data, &newline)),
                 until: UntilSpec {
-                    pattern: until,
+                    pattern: until.clone(),
                     regex: !literal,
                     strip_ansi,
                 },
@@ -238,14 +255,23 @@ async fn run(cli: Cli) -> Result<(), CliError> {
                 max_bytes: None,
                 max_output_bytes: Some(max_output_bytes),
             };
-            let v = call(
+            match call(
                 &mut framed,
                 &mut next_id,
                 "run",
                 serde_json::to_value(p).unwrap(),
             )
-            .await?;
-            print_match_result(&v, cli.json);
+            .await
+            {
+                Ok(v) => print_match_result(&v, cli.json),
+                Err(CliError::Timeout) => {
+                    eprintln!(
+                        "tether: timeout after {timeout_ms}ms waiting for {until:?}"
+                    );
+                    return Err(CliError::Timeout);
+                }
+                Err(e) => return Err(e),
+            }
         }
         Cmd::Tail { from } => {
             let session_id = attach(&mut framed, &mut next_id, &from).await?;
@@ -503,6 +529,16 @@ fn print_match_result(v: &Value, force_json: bool) {
         }
         summary.push(']');
         eprintln!("{summary}");
+    }
+}
+
+/// Append a line terminator if requested.
+fn apply_newline(data: String, kind: &str) -> String {
+    match kind {
+        "lf" => format!("{data}\n"),
+        "cr" => format!("{data}\r"),
+        "crlf" => format!("{data}\r\n"),
+        _ => data, // "none" or unknown
     }
 }
 
