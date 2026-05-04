@@ -1,0 +1,86 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg"
+     width="1200" height="630" viewBox="0 0 1200 630"
+     font-family="ui-monospace, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace">
+
+  <!-- background -->
+  <rect width="1200" height="630" fill="#0d1117"/>
+
+  <!-- subtle grid for that terminal feel -->
+  <g stroke="#161b22" stroke-width="1">
+    <line x1="0" y1="80"  x2="1200" y2="80"/>
+    <line x1="0" y1="550" x2="1200" y2="550"/>
+  </g>
+
+  <!-- mac-style window chrome dots, just for atmosphere -->
+  <g>
+    <circle cx="50" cy="50" r="8" fill="#ff5f57"/>
+    <circle cx="76" cy="50" r="8" fill="#febc2e"/>
+    <circle cx="102" cy="50" r="8" fill="#28c840"/>
+  </g>
+
+  <!-- title -->
+  <text x="60" y="180" font-size="84" font-weight="700" fill="#e6edf3" letter-spacing="-2">
+    Serial Tether
+  </text>
+
+  <!-- tagline -->
+  <text x="60" y="240" font-size="30" fill="#8b949e" font-weight="400">
+    one serial port. one daemon. many clients.
+  </text>
+
+  <!-- diagram -->
+  <g transform="translate(60, 310)" font-size="20" fill="#c9d1d9">
+    <!-- top row: clients -->
+    <text x="40"  y="0" fill="#7ee787">human</text>
+    <text x="200" y="0" fill="#79c0ff">AI&#160;agent</text>
+    <text x="380" y="0" fill="#d2a8ff">CI&#160;script</text>
+
+    <!-- arrows down -->
+    <g stroke="#30363d" stroke-width="2" fill="none">
+      <path d="M 70  20 L 70  60"/>
+      <path d="M 245 20 L 245 60"/>
+      <path d="M 415 20 L 415 60"/>
+      <!-- arrowheads -->
+      <polygon points="65,55 75,55 70,65" fill="#30363d"/>
+      <polygon points="240,55 250,55 245,65" fill="#30363d"/>
+      <polygon points="410,55 420,55 415,65" fill="#30363d"/>
+    </g>
+
+    <!-- daemon box -->
+    <rect x="0"   y="80" width="500" height="60" rx="8"
+          fill="#1f2937" stroke="#f78166" stroke-width="2"/>
+    <text x="20"  y="118" fill="#f78166" font-size="22" font-weight="600">tetherd</text>
+    <text x="120" y="118" fill="#8b949e" font-size="18">JSON-RPC over UDS / TCP</text>
+
+    <!-- arrow down to device -->
+    <g stroke="#30363d" stroke-width="2" fill="none">
+      <path d="M 250 145 L 250 185"/>
+      <polygon points="245,180 255,180 250,190" fill="#30363d"/>
+    </g>
+
+    <!-- device -->
+    <text x="120" y="215" fill="#e6edf3" font-size="22" font-weight="600">
+      /dev/tty.usbserial-XXXX
+    </text>
+    <text x="120" y="240" fill="#8b949e" font-size="16">
+      (bootloader, Linux console, MCU REPL, …)
+    </text>
+  </g>
+
+  <!-- right-side highlight -->
+  <g transform="translate(720, 310)" font-size="22" fill="#c9d1d9">
+    <text x="0" y="0"  fill="#e6edf3" font-size="26" font-weight="700">Why</text>
+    <text x="0" y="42">• race-free RPC for agents</text>
+    <text x="0" y="76">• raw-mode shell for humans</text>
+    <text x="0" y="110">• same port, both at once</text>
+    <text x="0" y="144">• U-Boot · Linux · RTOS · MCU</text>
+    <text x="0" y="178">• UDS · TCP · token auth</text>
+  </g>
+
+  <!-- footer -->
+  <g font-size="20" fill="#8b949e">
+    <text x="60" y="585">github.com/hulryung/serial-tether</text>
+    <text x="1140" y="585" text-anchor="end" fill="#f78166" font-weight="600">v0.5.0</text>
+  </g>
+</svg>

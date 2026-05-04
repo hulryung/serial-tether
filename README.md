@@ -1,5 +1,7 @@
 # Serial Tether
 
+![Serial Tether — one serial port, one daemon, many clients](assets/og.png)
+
 > A daemon and CLI that lets AI agents and humans share a single serial device.
 
 **Docs**:
