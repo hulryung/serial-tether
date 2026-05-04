@@ -56,6 +56,16 @@ away from the engineers who have always lived inside it.**
 
 ![Serial Tether usage model — same serial port, shared by humans and AI in real time](assets/usage-model.png)
 
+## Demo
+
+![Serial Tether demo — daemon banner, interactive shell, agent run, tail](assets/demo.gif)
+
+Daemon banner, a tio-style interactive shell on a U-Boot board, an agent's
+JSON `run`, and a `tail` — all 30 seconds. Same daemon, same port, same time.
+
+> Higher-fidelity (asciinema-player, click to seek):
+> <https://hulryung.github.io/serial-tether/#demo>
+
 ## Components
 
 The `serial-tether` package ships two binaries:
