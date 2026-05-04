@@ -13,6 +13,8 @@
 <meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:image" content="https://github.com/hulryung/serial-tether/raw/main/assets/og.png">
 
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/asciinema-player@3.7.1/dist/bundle/asciinema-player.css">
+
 <style>
   :root {
     --bg:        #0d1117;
@@ -270,6 +272,12 @@
   </figure>
 </section>
 
+<section id="demo" class="wrap">
+  <h2>Demo</h2>
+  <p class="muted">~30 seconds. Daemon banner, an interactive shell session, an agent-style JSON run, and a tail.</p>
+  <div id="demo-player" style="margin-top: 16px;"></div>
+</section>
+
 <section id="install" class="wrap">
   <h2>Install</h2>
   <p class="muted">All four paths give you the same two binaries: <code>tetherd</code> (daemon) and <code>tether</code> (client).</p>
@@ -411,6 +419,21 @@ TETHER_AUTH_TOKEN=&lt;token-from-banner&gt; \
     </p>
   </div>
 </footer>
+
+<script src="https://cdn.jsdelivr.net/npm/asciinema-player@3.7.1/dist/bundle/asciinema-player.min.js"></script>
+<script>
+  AsciinemaPlayer.create('demo.cast', document.getElementById('demo-player'), {
+    autoPlay: true,
+    loop: true,
+    speed: 1.0,
+    idleTimeLimit: 1.0,
+    theme: 'asciinema',
+    cols: 100,
+    rows: 30,
+    fit: 'width',
+    poster: 'npt:0:00',
+  });
+</script>
 
 </body>
 </html>
