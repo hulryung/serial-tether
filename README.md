@@ -4,6 +4,8 @@
 
 > A daemon and CLI that lets AI agents and humans share a single serial device.
 
+**Site**: <https://hulryung.github.io/serial-tether/>
+
 **Docs**:
 - [`docs/OVERVIEW.md`](docs/OVERVIEW.md) — what it is, why, and how it works (read this first)
 - [`docs/AGENT_USAGE.md`](docs/AGENT_USAGE.md) — one-page command cookbook for AI agents
