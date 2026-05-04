@@ -10,6 +10,46 @@
 
 `tetherd` owns the serial port; multiple clients (`tether`, user scripts, the future `tether-tui`) connect over a Unix socket / Named Pipe / TCP and read and write concurrently. The agent-facing CLI (`tether`) is transactional, structured, and bounded by design: JSON-RPC responses carry decoded text, exit codes follow shell conventions, the `run` primitive is race-free at the daemon level, and output truncation guards LLM context budgets.
 
+## Why
+
+Embedded development is a lot of staring at a serial console — kicking a
+bootloader, reading kernel logs, exercising firmware against a corner case.
+Increasingly an AI coding agent wants to do that staring too: react to a
+stack trace, set a U-Boot env var, drive a board through a regression suite,
+read sensor output, retry after a flash. The naïve loop — "agent describes
+a command in chat → human copies it into `tio` → human pastes the output
+back" — is slow, brittle, and pointless.
+
+Serial Tether's job is to hand that loop directly to the agent **without
+elbowing the human out**. The daemon takes ownership of `/dev/ttyUSB0`
+once. From there, three audiences share the same port at the same time:
+
+- **AI agents** drive the board through a JSON-RPC CLI that is transactional,
+  structured, and bounded by design. Race-free `run`, ANSI-stripped and
+  echo-stripped `output`, standard exit codes, configurable length
+  truncation so the LLM context never blows up — the things that turn flaky
+  scripted automation into reliable scripted automation.
+- **Humans** stay in full control on the same port: drop into a `tio`-style
+  raw-mode interactive shell with `tether`, tail every byte the agent is
+  sending and receiving with `tether tail`, override or interrupt at will.
+  No "agent mode" that locks the operator out — quite the opposite, the
+  human gets a god's-eye view of what every other client is doing.
+- **CI and shell scripts** ride the same wire. `if tether run … ; then …;
+  case $? in 124) … esac` is just a few lines, and it works the same way
+  whether the daemon is on this machine, behind SSH, or on a VM across the
+  room.
+
+The whole thing is meant to be agnostic about *what* sits on the other end
+of the serial link — U-Boot, Linux console, busybox login, vendor monitors,
+RTOS REPLs, raw MCU debug streams — because the daemon just shuttles bytes
+and surfaces them with race-free framing. Intelligence about prompts,
+escape sequences, and command grammars belongs in the client (or the agent
+driving it), where it's easy to evolve.
+
+In one line: **modern, AI-friendly, multi-tenant access to the serial port
+across the whole spectrum of embedded development, without taking the port
+away from the engineers who have always lived inside it.**
+
 ## Components
 
 The `serial-tether` package ships two binaries:
