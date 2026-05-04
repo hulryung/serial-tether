@@ -132,6 +132,35 @@ where
         }
     });
 
+    // Device-event task — subscribe to broadcast and forward as the
+    // `device` notification (PROTOCOL.md §7.5) so attached clients see
+    // disconnect/reconnect transitions without polling status.
+    let mut device_rx = state.device_events.subscribe();
+    let device_tx = out_tx.clone();
+    let device_task = tokio::spawn(async move {
+        loop {
+            match device_rx.recv().await {
+                Ok(event) => {
+                    let detail = event.detail.clone();
+                    let mut params = serde_json::json!({
+                        "kind": event.kind.as_str(),
+                    });
+                    if let Some(d) = detail {
+                        params["detail"] = serde_json::Value::String(d);
+                    }
+                    let _ = device_tx.send(Message::Notification(Notification::new(
+                        "device", params,
+                    )));
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    tracing::warn!(lagged = n, "device events lagged; resyncing");
+                    continue;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+
     // Message dispatch loop.
     while let Some(item) = source.next().await {
         let msg = match item {
@@ -164,6 +193,7 @@ where
 
     // Cleanup.
     fanout_task.abort();
+    device_task.abort();
     drop(out_tx);
     let _ = writer_task.await;
     for sid in conn.session_ids() {

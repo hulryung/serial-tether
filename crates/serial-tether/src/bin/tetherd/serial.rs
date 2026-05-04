@@ -18,10 +18,10 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use parking_lot::Mutex;
 use tokio::io::{unix::AsyncFd, AsyncReadExt, AsyncWriteExt, Interest};
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::{broadcast, mpsc, Notify};
 
 use crate::buffer::RingBuffer;
-use crate::state::DeviceState;
+use crate::state::{DeviceEvent, DeviceEventKind, DeviceState};
 
 #[derive(Debug, Clone)]
 pub struct SerialConfig {
@@ -154,6 +154,7 @@ pub fn spawn(
     state: Arc<Mutex<DeviceState>>,
     force_reconnect: Arc<Notify>,
     reconnected: Arc<Notify>,
+    device_events: broadcast::Sender<DeviceEvent>,
 ) -> (SerialWriter, tokio::task::JoinHandle<()>) {
     let (tx, mut rx) = mpsc::channel::<WriteJob>(64);
     let writer = SerialWriter { tx };
@@ -162,6 +163,11 @@ pub fn spawn(
         let initial_backoff = Duration::from_millis(500);
         let max_backoff = Duration::from_secs(10);
         let mut backoff = initial_backoff;
+        // We don't broadcast a Disconnected on the *first* open failure (no
+        // one was attached yet, and the daemon refuses to start if the
+        // first open fails anyway). After we've been connected once, every
+        // transition emits an event.
+        let mut emit_disconnect = false;
 
         loop {
             // Try to open the device. While in retry, drain pending write
@@ -170,14 +176,24 @@ pub fn spawn(
                 match SerialPort::open(&cfg).await {
                     Ok(p) => {
                         tracing::info!(path = %cfg.path, "serial opened");
-                        {
+                        let was_connected = {
                             let mut s = state.lock();
+                            let prev = s.connected;
                             s.connected = true;
                             s.last_open_at = Some(Instant::now());
                             s.last_disconnect_reason = None;
                             s.consecutive_open_failures = 0;
+                            prev
+                        };
+                        if !was_connected {
+                            // First open or coming back up — clients want to know.
+                            let _ = device_events.send(DeviceEvent {
+                                kind: DeviceEventKind::Reconnected,
+                                detail: None,
+                            });
                         }
                         reconnected.notify_waiters();
+                        emit_disconnect = true;
                         backoff = initial_backoff;
                         break p;
                     }
@@ -191,7 +207,7 @@ pub fn spawn(
                         {
                             let mut s = state.lock();
                             s.connected = false;
-                            s.last_disconnect_reason = Some(reason);
+                            s.last_disconnect_reason = Some(reason.clone());
                             s.consecutive_open_failures += 1;
                         }
                         // While waiting, fail any pending writes immediately
@@ -223,8 +239,14 @@ pub fn spawn(
             {
                 let mut s = state.lock();
                 s.connected = false;
-                s.last_disconnect_reason = Some(reason);
+                s.last_disconnect_reason = Some(reason.clone());
                 s.disconnect_count += 1;
+            }
+            if emit_disconnect {
+                let _ = device_events.send(DeviceEvent {
+                    kind: DeviceEventKind::Disconnected,
+                    detail: Some(reason),
+                });
             }
             // Brief gap before next reopen attempt so a flapping device
             // doesn't pin a CPU.

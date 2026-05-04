@@ -30,6 +30,18 @@ fn parse_params<T: serde::de::DeserializeOwned>(p: Option<Value>) -> Result<T, P
     serde_json::from_value(v).map_err(|e| err_with(ErrorCode::InvalidParams, e.to_string()))
 }
 
+/// Map an io::Error from the serial writer into the right protocol error.
+/// `NotConnected` is the precise kind we set in `serial.rs` while waiting
+/// for the device to reopen, so it maps to the public DeviceDisconnected
+/// code instead of generic InternalError.
+fn writer_error_to_proto(e: std::io::Error) -> ProtocolError {
+    if e.kind() == std::io::ErrorKind::NotConnected {
+        ProtocolError::new(ErrorCode::DeviceDisconnected).with_message(e.to_string())
+    } else {
+        err_with(ErrorCode::InternalError, e.to_string())
+    }
+}
+
 fn b64_decode(s: &str) -> Result<Vec<u8>, ProtocolError> {
     base64::engine::general_purpose::STANDARD
         .decode(s)
@@ -164,7 +176,7 @@ pub async fn send(
         .writer
         .write(bytes)
         .await
-        .map_err(|e| err_with(ErrorCode::InternalError, e.to_string()))?;
+        .map_err(writer_error_to_proto)?;
     if p.eat_echo {
         session.lock().consumer_cursor = sent_at_seq + n;
     }
@@ -223,7 +235,7 @@ pub async fn run(
         .writer
         .write(bytes.clone())
         .await
-        .map_err(|e| err_with(ErrorCode::InternalError, e.to_string()))?;
+        .map_err(writer_error_to_proto)?;
 
     let strip_echo_bytes: Option<&[u8]> = if p.strip_echo {
         Some(bytes.as_slice())

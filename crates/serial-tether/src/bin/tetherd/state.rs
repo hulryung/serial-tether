@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use parking_lot::Mutex;
-use tokio::sync::Notify;
+use tokio::sync::{broadcast, Notify};
 
 use crate::buffer::RingBuffer;
 use crate::serial::{SerialConfig, SerialWriter};
@@ -36,6 +36,29 @@ impl DeviceState {
     }
 }
 
+/// Device-state transition broadcast across all connections, surfaced to
+/// clients as the `device` notification (see PROTOCOL.md §7.5).
+#[derive(Clone, Debug)]
+pub struct DeviceEvent {
+    pub kind: DeviceEventKind,
+    pub detail: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum DeviceEventKind {
+    Disconnected,
+    Reconnected,
+}
+
+impl DeviceEventKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Disconnected => "disconnected",
+            Self::Reconnected => "reconnected",
+        }
+    }
+}
+
 /// Single writer lock used by `run` transactions.
 /// `holder == None` means the lock is free; `Some(id)` means session `id`
 /// owns it.
@@ -64,4 +87,7 @@ pub struct DaemonState {
     /// Notify when device_state transitions to connected (used by `reconnect`
     /// to wait for the reopen to complete).
     pub reconnected: Arc<Notify>,
+    /// Broadcast channel for device-state transitions. Each connection
+    /// subscribes once and emits `device` notifications to its clients.
+    pub device_events: broadcast::Sender<DeviceEvent>,
 }

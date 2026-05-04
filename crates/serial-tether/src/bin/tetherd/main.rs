@@ -189,12 +189,16 @@ async fn main() -> Result<()> {
     let device_state = Arc::new(parking_lot::Mutex::new(crate::state::DeviceState::new_disconnected()));
     let force_reconnect = Arc::new(tokio::sync::Notify::new());
     let reconnected = Arc::new(tokio::sync::Notify::new());
+    // Capacity 32 is plenty for device transitions; subscribers that fall
+    // behind get RecvError::Lagged which conn.rs treats as drop-and-resync.
+    let (device_events_tx, _) = tokio::sync::broadcast::channel::<crate::state::DeviceEvent>(32);
     let (writer, _serial_task) = serial::spawn(
         cfg.clone(),
         buffer.clone(),
         device_state.clone(),
         force_reconnect.clone(),
         reconnected.clone(),
+        device_events_tx.clone(),
     );
 
     // Resolve the auth token. Generate one if --tcp is enabled without --auth-token.
@@ -222,6 +226,7 @@ async fn main() -> Result<()> {
         device_state,
         force_reconnect,
         reconnected,
+        device_events: device_events_tx,
     };
 
     let mut listener_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();

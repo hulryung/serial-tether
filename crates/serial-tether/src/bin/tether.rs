@@ -45,6 +45,12 @@ struct Cli {
     #[arg(long, global = true, env = "TETHER_AUTH_TOKEN")]
     auth_token: Option<String>,
 
+    /// On a `device_disconnected` reply, automatically issue `reconnect`
+    /// and retry the original RPC once. Useful for long-running scripts
+    /// that should ride out a USB hiccup. Off by default.
+    #[arg(long, global = true)]
+    auto_reconnect: bool,
+
     /// If no subcommand is given, drops into the interactive shell.
     #[command(subcommand)]
     cmd: Option<Cmd>,
@@ -302,8 +308,14 @@ where
             } else {
                 p.data_text = Some(apply_newline(data, &newline));
             }
-            let v = call(&mut framed, &mut next_id, "send", serde_json::to_value(p).unwrap())
-                .await?;
+            let v = call_or_retry(
+                &mut framed,
+                &mut next_id,
+                "send",
+                serde_json::to_value(p).unwrap(),
+                cli.auto_reconnect,
+            )
+            .await?;
             print_json_or_pairs(&v, cli.json);
         }
         Cmd::Expect {
@@ -325,11 +337,12 @@ where
                 max_bytes: None,
                 max_output_bytes: Some(max_output_bytes),
             };
-            match call(
+            match call_or_retry(
                 &mut framed,
                 &mut next_id,
                 "expect",
                 serde_json::to_value(p).unwrap(),
+                cli.auto_reconnect,
             )
             .await
             {
@@ -370,11 +383,12 @@ where
                 max_bytes: None,
                 max_output_bytes: Some(max_output_bytes),
             };
-            match call(
+            match call_or_retry(
                 &mut framed,
                 &mut next_id,
                 "run",
                 serde_json::to_value(p).unwrap(),
+                cli.auto_reconnect,
             )
             .await
             {
@@ -515,6 +529,51 @@ where
     }
 }
 
+/// Same as `call`, but if the daemon replies `device_disconnected` and
+/// `auto_reconnect` is true, transparently kicks `reconnect` and retries
+/// the original RPC once. The `reconnect` method itself is excluded so
+/// we don't recurse.
+async fn call_or_retry<S>(
+    framed: &mut Framed<S, NdjsonCodec>,
+    next_id: &mut i64,
+    method: &str,
+    params: Value,
+    auto_reconnect: bool,
+) -> Result<Value, CliError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let first = call(framed, next_id, method, params.clone()).await;
+    if !auto_reconnect || method == "reconnect" {
+        return first;
+    }
+    if !matches!(&first, Err(CliError::DeviceDisconnected)) {
+        return first;
+    }
+    eprintln!("tether: device disconnected — attempting reconnect …");
+    let recon = call(
+        framed,
+        next_id,
+        "reconnect",
+        json!({"wait": true, "timeout_ms": 10000}),
+    )
+    .await;
+    match recon {
+        Ok(v) if v.get("device_connected").and_then(|b| b.as_bool()).unwrap_or(false) => {
+            eprintln!("tether: reconnected — retrying {method}");
+            call(framed, next_id, method, params).await
+        }
+        Ok(_) => {
+            eprintln!("tether: reconnect did not bring device back; failing");
+            Err(CliError::DeviceDisconnected)
+        }
+        Err(e) => {
+            eprintln!("tether: reconnect call failed: {e:?}");
+            first
+        }
+    }
+}
+
 fn map_rpc_error(code: i32, msg: String) -> CliError {
     use tether_protocol::error::ErrorCode as E;
     if code == E::Timeout.as_i32() {
@@ -544,20 +603,35 @@ where
     while let Some(item) = framed.next().await {
         let msg = item.map_err(|e| CliError::Protocol(e.to_string()))?;
         if let Message::Notification(Notification { method, params, .. }) = msg {
-            if method == "data" {
-                if let Some(p) = params {
-                    if let Some(sid) = p.get("session_id").and_then(|s| s.as_str()) {
-                        if sid != session_id {
-                            continue;
+            match method.as_str() {
+                "data" => {
+                    if let Some(p) = params {
+                        if let Some(sid) = p.get("session_id").and_then(|s| s.as_str()) {
+                            if sid != session_id {
+                                continue;
+                            }
                         }
-                    }
-                    if let Some(b64) = p.get("data").and_then(|s| s.as_str()) {
-                        if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64) {
-                            stdout.write_all(&bytes).ok();
-                            stdout.flush().ok();
+                        if let Some(b64) = p.get("data").and_then(|s| s.as_str()) {
+                            if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64) {
+                                stdout.write_all(&bytes).ok();
+                                stdout.flush().ok();
+                            }
                         }
                     }
                 }
+                "device" => {
+                    if let Some(p) = params {
+                        let kind = p.get("kind").and_then(|s| s.as_str()).unwrap_or("?");
+                        let detail = p.get("detail").and_then(|s| s.as_str()).unwrap_or("");
+                        let _ = stdout.flush();
+                        if detail.is_empty() {
+                            eprintln!("\n[device {kind}]");
+                        } else {
+                            eprintln!("\n[device {kind}: {detail}]");
+                        }
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -619,15 +693,31 @@ where
         }
     });
 
-    // Reader task: stream `data` notifications for our session straight to stdout.
+    // Reader task: stream `data` notifications for our session straight to
+    // stdout, and surface `device` (dis|re)connect events to stderr.
     let target = session_id.clone();
     let reader = tokio::spawn(async move {
         while let Some(item) = source.next().await {
             let Ok(msg) = item else { break };
-            if let Message::Notification(Notification { method, params, .. }) = msg {
-                if method != "data" {
-                    continue;
+            let Message::Notification(Notification { method, params, .. }) = msg else {
+                continue;
+            };
+            if method == "device" {
+                if let Some(p) = params {
+                    let kind = p.get("kind").and_then(|s| s.as_str()).unwrap_or("?");
+                    let detail = p.get("detail").and_then(|s| s.as_str()).unwrap_or("");
+                    if detail.is_empty() {
+                        eprint!("\r\n[device {kind}]\r\n");
+                    } else {
+                        eprint!("\r\n[device {kind}: {detail}]\r\n");
+                    }
                 }
+                continue;
+            }
+            if method != "data" {
+                continue;
+            }
+            {
                 let Some(p) = params else { continue };
                 if let Some(sid) = p.get("session_id").and_then(|s| s.as_str()) {
                     if sid != target {
