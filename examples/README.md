@@ -1,7 +1,7 @@
 # Examples
 
 Real-world automation scripts an AI agent can read, copy, and adapt. Each
-example follows the canonical pattern from [AGENTS.md](../AGENTS.md): one
+example follows the canonical pattern from [docs/AGENT_USAGE.md](../docs/AGENT_USAGE.md): one
 `tether sync` to detect the prompt, then `tether run` per command with that
 prompt as the anchor.
 
