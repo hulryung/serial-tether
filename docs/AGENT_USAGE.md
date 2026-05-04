@@ -1,6 +1,9 @@
 # Serial Tether — Guide for AI Agents
 
 > One page. Read once. You can drive an embedded serial console after this.
+>
+> **Want the *why* before the *how*?** Read [OVERVIEW.md](OVERVIEW.md) first
+> for the mental model and architecture. This file is a script-level cookbook.
 
 You are an AI agent that has been given access to `tether`, a CLI for talking
 to a serial device through the `tetherd` daemon. The daemon owns the port;

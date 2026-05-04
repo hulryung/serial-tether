@@ -2,8 +2,11 @@
 
 > A daemon and CLI that lets AI agents and humans share a single serial device.
 
-📖 **For AI agents**: read [`docs/AGENT_USAGE.md`](docs/AGENT_USAGE.md) — one
-page, after which you can drive any embedded serial console.
+**Docs**:
+- [`docs/OVERVIEW.md`](docs/OVERVIEW.md) — what it is, why, and how it works (read this first)
+- [`docs/AGENT_USAGE.md`](docs/AGENT_USAGE.md) — one-page command cookbook for AI agents
+- [`docs/PROTOCOL.md`](docs/PROTOCOL.md) — JSON-RPC 2.0 / NDJSON wire spec (v1)
+- [`examples/`](examples/) — five working Bash automation scripts
 
 `tetherd` owns the serial port; multiple clients (`tether`, user scripts, the future `tether-tui`) connect over a Unix socket / Named Pipe / TCP and read and write concurrently. The agent-facing CLI (`tether`) is transactional, structured, and bounded by design: JSON-RPC responses carry decoded text, exit codes follow shell conventions, the `run` primitive is race-free at the daemon level, and output truncation guards LLM context budgets.
 
