@@ -45,11 +45,12 @@ struct Cli {
     #[arg(long, global = true, env = "TETHER_AUTH_TOKEN")]
     auth_token: Option<String>,
 
+    /// If no subcommand is given, drops into the interactive shell.
     #[command(subcommand)]
-    cmd: Cmd,
+    cmd: Option<Cmd>,
 }
 
-#[derive(Subcommand, Debug)]
+#[derive(Subcommand, Debug, Clone)]
 enum Cmd {
     /// Send data to the device. Does not wait for a response.
     Send {
@@ -112,6 +113,14 @@ enum Cmd {
         #[arg(long, default_value_t = 2000)]
         timeout_ms: u32,
     },
+    /// Interactive raw-mode shell. Type to send keystrokes, see live device
+    /// output. Press Ctrl-A then Q to quit, Ctrl-A then Ctrl-A to send a
+    /// literal Ctrl-A, Ctrl-A then ? for help.
+    Shell {
+        /// Replay buffer position when attaching.
+        #[arg(long, default_value = "now", value_parser = ["start", "now"])]
+        from: String,
+    },
 }
 
 fn main() -> ExitCode {
@@ -133,7 +142,14 @@ fn main() -> ExitCode {
             ExitCode::from(2)
         }
         Err(CliError::Connection(msg)) => {
-            eprintln!("connection error: {msg}");
+            // The message itself is already self-contained (multi-line) for
+            // the common cases — print it verbatim instead of mashing it on
+            // one line behind a "connection error:" prefix.
+            if msg.contains('\n') {
+                eprintln!("{msg}");
+            } else {
+                eprintln!("tether: connection error: {msg}");
+            }
             ExitCode::from(3)
         }
     }
@@ -180,14 +196,14 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         Endpoint::Uds(path) => {
             let stream = UnixStream::connect(path)
                 .await
-                .map_err(|e| CliError::Connection(format!("connect {path:?}: {e}")))?;
+                .map_err(|e| make_uds_connect_error(path, e))?;
             let framed = Framed::new(stream, NdjsonCodec::new());
             run_with_stream(framed, cli).await
         }
         Endpoint::Tcp(addr) => {
             let stream = TcpStream::connect(addr)
                 .await
-                .map_err(|e| CliError::Connection(format!("connect tcp:{addr}: {e}")))?;
+                .map_err(|e| make_tcp_connect_error(addr, e))?;
             let _ = stream.set_nodelay(true);
             let framed = Framed::new(stream, NdjsonCodec::new());
             run_with_stream(framed, cli).await
@@ -195,9 +211,48 @@ async fn run(cli: Cli) -> Result<(), CliError> {
     }
 }
 
+/// Build a friendly multi-line error when the local Unix socket can't be
+/// dialed — the most common cause is "the daemon hasn't been started yet".
+fn make_uds_connect_error(path: &str, e: std::io::Error) -> CliError {
+    use std::io::ErrorKind;
+    let cause = match e.kind() {
+        ErrorKind::NotFound => "socket file does not exist (daemon not running?)",
+        ErrorKind::ConnectionRefused => "connection refused (stale socket from a crashed daemon?)",
+        _ => return CliError::Connection(format!("connect {path}: {e}")),
+    };
+    let msg = format!(
+        "tether: cannot connect to {path} — {cause}\n\
+         \n\
+         Start the daemon first:\n\
+         \n\
+         \x20\x20tetherd -D /dev/tty.usbserial-XXXX -b 115200\n\
+         \n\
+         Or expose it for remote agents:\n\
+         \n\
+         \x20\x20tetherd -D /dev/tty.usbserial-XXXX -b 115200 --tcp\n\
+         \n\
+         (Run `tetherd --help` for all options.)"
+    );
+    CliError::Connection(msg)
+}
+
+fn make_tcp_connect_error(addr: &str, e: std::io::Error) -> CliError {
+    let msg = format!(
+        "tether: cannot connect to tcp://{addr} — {e}\n\
+         \n\
+         Check that the daemon is running on the remote host with:\n\
+         \n\
+         \x20\x20tetherd -D /dev/tty.usbserial-XXXX -b 115200 --tcp\n\
+         \n\
+         If a firewall is in the way, ensure the port is open.\n\
+         For TCP, set TETHER_AUTH_TOKEN or pass --auth-token."
+    );
+    CliError::Connection(msg)
+}
+
 async fn run_with_stream<S>(mut framed: Framed<S, NdjsonCodec>, cli: Cli) -> Result<(), CliError>
 where
-    S: AsyncRead + AsyncWrite + Unpin,
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let mut next_id: i64 = 1;
 
@@ -218,7 +273,8 @@ where
     )
     .await?;
 
-    match cli.cmd {
+    let cmd = cli.cmd.clone().unwrap_or(Cmd::Shell { from: "now".into() });
+    match cmd {
         Cmd::Status => {
             let v = call(&mut framed, &mut next_id, "status", json!({})).await?;
             print_json_or_pairs(&v, cli.json);
@@ -325,6 +381,11 @@ where
         Cmd::Tail { from } => {
             let session_id = attach(&mut framed, &mut next_id, &from).await?;
             tail_loop(&mut framed, &session_id).await?;
+        }
+        Cmd::Shell { from } => {
+            let session_id = attach(&mut framed, &mut next_id, &from).await?;
+            shell_loop(framed, session_id).await?;
+            return Ok(());
         }
         Cmd::Sync { idle_ms, timeout_ms } => {
             let session_id = attach(&mut framed, &mut next_id, "now").await?;
@@ -462,6 +523,171 @@ where
             }
         }
     }
+    Ok(())
+}
+
+/// Interactive raw-mode shell. Spins up:
+/// - a sender task that drains an mpsc channel of outgoing JSON-RPC messages,
+/// - a reader task that turns incoming `data` notifications into stdout writes,
+/// - a stdin reader thread (blocking) that pushes raw bytes into a channel.
+///
+/// The main async loop pulls stdin chunks, scans for the Ctrl-A escape, and
+/// sends keystrokes to the device as `send` RPCs. RAII guard restores the
+/// terminal mode on any exit path (including panic).
+async fn shell_loop<S>(framed: Framed<S, NdjsonCodec>, session_id: String) -> Result<(), CliError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+    use std::io::{IsTerminal as _, Write as _};
+
+    /// Restores terminal mode whenever this guard drops (Ok, Err, or panic).
+    struct RawModeGuard {
+        active: bool,
+    }
+    impl Drop for RawModeGuard {
+        fn drop(&mut self) {
+            if self.active {
+                let _ = disable_raw_mode();
+                eprint!("\r\n");
+            }
+        }
+    }
+
+    let is_tty = std::io::stdin().is_terminal();
+    let _guard = if is_tty {
+        enable_raw_mode().map_err(|e| CliError::Connection(format!("raw mode: {e}")))?;
+        RawModeGuard { active: true }
+    } else {
+        // Piped stdin (scripts, tests) — skip raw mode but everything else works.
+        RawModeGuard { active: false }
+    };
+
+    if is_tty {
+        eprint!(
+            "\r\n[tether shell — Ctrl-A then Q to quit, Ctrl-A ? for help]\r\n\r\n"
+        );
+    }
+
+    let (mut sink, mut source) = framed.split();
+    let (msg_tx, mut msg_rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
+
+    // Sender task: serialise outgoing messages to the daemon.
+    let sender = tokio::spawn(async move {
+        while let Some(msg) = msg_rx.recv().await {
+            if sink.send(msg).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    // Reader task: stream `data` notifications for our session straight to stdout.
+    let target = session_id.clone();
+    let reader = tokio::spawn(async move {
+        while let Some(item) = source.next().await {
+            let Ok(msg) = item else { break };
+            if let Message::Notification(Notification { method, params, .. }) = msg {
+                if method != "data" {
+                    continue;
+                }
+                let Some(p) = params else { continue };
+                if let Some(sid) = p.get("session_id").and_then(|s| s.as_str()) {
+                    if sid != target {
+                        continue;
+                    }
+                }
+                if let Some(b64) = p.get("data").and_then(|s| s.as_str()) {
+                    if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64) {
+                        let mut stdout = std::io::stdout().lock();
+                        let _ = stdout.write_all(&bytes);
+                        let _ = stdout.flush();
+                    }
+                }
+            }
+        }
+    });
+
+    // Stdin reader thread (blocking). Pushes chunks into an mpsc.
+    let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    std::thread::spawn(move || {
+        use std::io::Read;
+        let stdin = std::io::stdin();
+        let mut handle = stdin.lock();
+        let mut buf = [0u8; 4096];
+        loop {
+            match handle.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if stdin_tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut next_id: i64 = 1_000_000;
+    let mut escape_pending = false;
+
+    // Helper closure: send a chunk of bytes via the message channel.
+    let send_bytes = |bytes: &[u8], next_id: &mut i64| -> bool {
+        if bytes.is_empty() {
+            return true;
+        }
+        let p = SendParams {
+            session_id: session_id.clone(),
+            data: Some(base64::engine::general_purpose::STANDARD.encode(bytes)),
+            data_text: None,
+            eat_echo: false,
+        };
+        let id = *next_id;
+        *next_id += 1;
+        let req = Request::new(RpcId::Number(id), "send", serde_json::to_value(p).unwrap());
+        msg_tx.send(Message::Request(req)).is_ok()
+    };
+
+    let print_help = || {
+        eprint!(
+            "\r\n[Ctrl-A Q  : quit]\r\n\
+             [Ctrl-A ?  : help]\r\n\
+             [Ctrl-A ^A : send literal Ctrl-A]\r\n\r\n"
+        );
+    };
+
+    'main: while let Some(chunk) = stdin_rx.recv().await {
+        let mut buffer: Vec<u8> = Vec::with_capacity(chunk.len());
+        for &b in &chunk {
+            if escape_pending {
+                escape_pending = false;
+                match b {
+                    b'q' | b'Q' => {
+                        if !buffer.is_empty() {
+                            let _ = send_bytes(&buffer, &mut next_id);
+                        }
+                        break 'main;
+                    }
+                    0x01 => buffer.push(0x01), // literal Ctrl-A
+                    b'?' | b'h' | b'H' => print_help(),
+                    other => {
+                        eprint!("\r\n[unknown escape: Ctrl-A {}]\r\n", other as char);
+                    }
+                }
+            } else if b == 0x01 {
+                escape_pending = true;
+            } else {
+                buffer.push(b);
+            }
+        }
+        if !buffer.is_empty() && !send_bytes(&buffer, &mut next_id) {
+            break;
+        }
+    }
+
+    // Cleanup: drop sender (flushes remaining), then await tasks.
+    drop(msg_tx);
+    let _ = sender.await;
+    reader.abort();
     Ok(())
 }
 

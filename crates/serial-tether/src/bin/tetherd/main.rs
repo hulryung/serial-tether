@@ -5,6 +5,7 @@ mod serial;
 mod session;
 mod state;
 
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -36,8 +37,15 @@ struct Args {
     #[arg(long)]
     no_uds: bool,
 
-    /// Also listen on TCP at HOST:PORT (e.g. 0.0.0.0:5557). Requires auth.
-    #[arg(long, value_name = "HOST:PORT")]
+    /// Also listen on TCP. Use bare `--tcp` for the default `0.0.0.0:5557`
+    /// (network-reachable) or `--tcp HOST:PORT` for an explicit endpoint
+    /// (e.g. `--tcp 127.0.0.1:5557` for localhost only). Requires auth.
+    #[arg(
+        long,
+        value_name = "HOST:PORT",
+        num_args = 0..=1,
+        default_missing_value = "0.0.0.0:5557",
+    )]
     tcp: Option<String>,
 
     /// Auth token for TCP clients. Random token is generated if --tcp is set
@@ -55,6 +63,95 @@ fn random_token() -> String {
     use uuid::Uuid;
     let u = Uuid::new_v4();
     u.simple().to_string()
+}
+
+/// Print a human-friendly startup banner to stderr summarising what the
+/// daemon is listening on and how to reach it.
+fn print_banner(args: &Args, tcp_addr: Option<SocketAddr>, auth_token: Option<&str>) {
+    eprintln!();
+    eprintln!("Serial Tether {}", env!("CARGO_PKG_VERSION"));
+    eprintln!("  device     {} @ {} baud", args.device, args.baud);
+    eprintln!("  buffer     {} KiB", args.buffer_capacity / 1024);
+    if let Some(tok) = auth_token {
+        eprintln!("  auth       {tok}");
+        eprintln!("             (clients: --auth-token {tok}  or  TETHER_AUTH_TOKEN={tok})");
+    }
+    eprintln!();
+    eprintln!("Listening:");
+    if !args.no_uds {
+        eprintln!("  unix       {}", args.socket.display());
+    }
+    if let Some(bind) = tcp_addr {
+        eprintln!("  tcp        {bind}    (auth required)");
+        let reachable = enumerate_reachable_ips(bind);
+        if !reachable.is_empty() {
+            eprintln!("               reachable as:");
+            for (ip, label) in reachable {
+                let port = bind.port();
+                if let Some(name) = label {
+                    eprintln!("                 tcp://{ip}:{port:<5}  ({name})");
+                } else {
+                    eprintln!("                 tcp://{ip}:{port}");
+                }
+            }
+        }
+    }
+    eprintln!();
+    let example_target = match tcp_addr {
+        Some(_) => format!(
+            "TETHER_AUTH_TOKEN={} tether -s tcp://<host>:{}",
+            auth_token.unwrap_or("..."),
+            tcp_addr.unwrap().port()
+        ),
+        None => "tether".to_string(),
+    };
+    eprintln!("  try:       {example_target} status");
+    eprintln!();
+}
+
+/// For a given listening socket, return the set of IPs a client could
+/// actually reach the daemon on. Wildcard binds (0.0.0.0 / ::) are expanded
+/// into every up, non-link-local interface address; specific binds return
+/// just that address.
+fn enumerate_reachable_ips(bind: SocketAddr) -> Vec<(IpAddr, Option<String>)> {
+    let want_v4 = bind.is_ipv4();
+    let is_wildcard = bind.ip().is_unspecified();
+
+    if !is_wildcard {
+        return vec![(bind.ip(), None)];
+    }
+
+    let Ok(ifaces) = if_addrs::get_if_addrs() else {
+        return vec![(bind.ip(), None)];
+    };
+
+    let mut out: Vec<(IpAddr, Option<String>)> = Vec::new();
+    let mut loopback: Vec<(IpAddr, Option<String>)> = Vec::new();
+    for iface in ifaces {
+        let ip = iface.ip();
+        if want_v4 && !ip.is_ipv4() {
+            continue;
+        }
+        if !want_v4 && !ip.is_ipv6() {
+            continue;
+        }
+        // Skip IPv6 link-local — they need a zone id and aren't useful here.
+        if let IpAddr::V6(v6) = ip {
+            let seg = v6.segments()[0];
+            if seg & 0xffc0 == 0xfe80 {
+                continue;
+            }
+        }
+        let entry = (ip, Some(iface.name.clone()));
+        if ip.is_loopback() {
+            loopback.push(entry);
+        } else {
+            out.push(entry);
+        }
+    }
+    // Loopback first, then routable addresses.
+    loopback.extend(out);
+    loopback
 }
 
 #[tokio::main]
@@ -84,13 +181,11 @@ async fn main() -> Result<()> {
     let (writer, _serial_task) = serial::spawn(port, buffer.clone());
 
     // Resolve the auth token. Generate one if --tcp is enabled without --auth-token.
-    let auth_token = if args.tcp.is_some() {
-        let token = args.auth_token.unwrap_or_else(|| {
-            let t = random_token();
-            eprintln!("tetherd: generated auth token (use --auth-token TOKEN to set explicitly):");
-            eprintln!("tetherd:   {t}");
-            t
-        });
+    let auth_token: Option<Arc<String>> = if args.tcp.is_some() {
+        let token = args
+            .auth_token
+            .clone()
+            .unwrap_or_else(random_token);
         Some(Arc::new(token))
     } else if args.auth_token.is_some() {
         // No --tcp but token given — accept it (allows pre-generation), but warn.
@@ -106,10 +201,11 @@ async fn main() -> Result<()> {
         sessions: Arc::new(SessionManager::new()),
         config: cfg,
         lock: Arc::new(crate::state::WriterLock::default()),
-        auth_token,
+        auth_token: auth_token.clone(),
     };
 
     let mut listener_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    let mut tcp_bound: Option<SocketAddr> = None;
 
     // UDS listener.
     if !args.no_uds {
@@ -119,7 +215,7 @@ async fn main() -> Result<()> {
         }
         let listener = UnixListener::bind(&args.socket)
             .with_context(|| format!("bind {:?}", args.socket))?;
-        tracing::info!(socket=?args.socket, device=%args.device, baud=args.baud, "tetherd listening (UDS)");
+        tracing::debug!(socket=?args.socket, "UDS listener bound");
         let state_uds = state.clone();
         listener_tasks.push(tokio::spawn(async move {
             loop {
@@ -146,7 +242,9 @@ async fn main() -> Result<()> {
         let listener = TcpListener::bind(&addr)
             .await
             .with_context(|| format!("bind tcp:{addr}"))?;
-        tracing::info!(addr=%addr, device=%args.device, baud=args.baud, "tetherd listening (TCP, auth required)");
+        let local = listener.local_addr().ok();
+        tcp_bound = local;
+        tracing::debug!(addr=%addr, "TCP listener bound");
         let state_tcp = state.clone();
         listener_tasks.push(tokio::spawn(async move {
             loop {
@@ -173,6 +271,9 @@ async fn main() -> Result<()> {
     if listener_tasks.is_empty() {
         anyhow::bail!("no listener configured");
     }
+
+    // Human-friendly summary to stderr.
+    print_banner(&args, tcp_bound, auth_token.as_deref().map(String::as_str));
 
     // Wait for any listener task to exit (which means accept failed).
     for h in listener_tasks {
