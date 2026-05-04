@@ -18,7 +18,7 @@ use crate::session::SessionManager;
 use crate::state::DaemonState;
 
 #[derive(Debug, Parser)]
-#[command(version, about = "tetherd — serial port daemon")]
+#[command(name = "tetherd", version, about = "tetherd — serial port daemon")]
 struct Args {
     /// Serial device path (e.g. /dev/ttyUSB0, or a PTY)
     #[arg(short = 'D', long)]

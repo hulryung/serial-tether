@@ -29,7 +29,7 @@ use tether_protocol::{
 };
 
 #[derive(Parser, Debug)]
-#[command(version, about = "tether — non-interactive client for tetherd")]
+#[command(name = "tether", version, about = "tether — non-interactive client for tetherd")]
 struct Cli {
     /// Daemon Unix socket
     #[arg(short = 's', long, default_value = "/tmp/tetherd.sock", global = true)]
