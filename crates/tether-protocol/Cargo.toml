@@ -1,11 +1,14 @@
 [package]
 name = "tether-protocol"
-description = "Serial Tether — wire protocol types and NDJSON codec (shared by tetherd and tether)"
+description = "Wire-protocol types and NDJSON codec for Serial Tether (shared by the tetherd daemon and tether client)."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
+readme = "../../README.md"
+keywords = ["serial", "embedded", "json-rpc", "protocol", "agent"]
+categories = ["embedded", "network-programming", "encoding"]
 
 [dependencies]
 serde = { workspace = true }

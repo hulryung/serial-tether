@@ -1,11 +1,14 @@
 [package]
 name = "serial-tether"
-description = "Serial Tether — daemon and CLI for sharing a serial device with humans and AI agents"
+description = "Daemon and CLI that lets AI agents and humans share a single serial device. Ships `tetherd` (daemon) and `tether` (non-interactive client) with JSON-RPC over NDJSON, UDS and TCP transports, and agent-friendly defaults."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
+readme = "../../README.md"
+keywords = ["serial", "uart", "embedded", "agent", "automation"]
+categories = ["command-line-utilities", "embedded", "development-tools"]
 
 [[bin]]
 name = "tether"
