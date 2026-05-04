@@ -3,8 +3,9 @@
 > One page. Read once. You can drive an embedded serial console after this.
 
 You are an AI agent that has been given access to `tether`, a CLI for talking
-to a serial device through the `tetherd` daemon. The daemon owns the port; you
-attach over a Unix socket (or a TCP bridge — see "Remote daemons" below).
+to a serial device through the `tetherd` daemon. The daemon owns the port;
+you attach either over a Unix socket (local) or directly via TCP with a token
+(remote — see "Remote daemons" below).
 
 ## Single canonical command
 
@@ -169,16 +170,19 @@ tether -s tcp://daemon-host:5557 run "version" --newline crlf -u "# " --literal
 ```
 
 UDS still works for local connections (OS-level auth via file permissions).
-Daemons can listen on both transports at once.
+A single daemon can listen on both transports at once.
 
-If you can't change the daemon, you can still bridge an old daemon's UDS over
-SSH:
+If you're stuck with a pre-v0.4 daemon you cannot upgrade, fall back to SSH
+forwarding the UDS:
 
 ```sh
-# Forward the remote socket onto your local filesystem.
-ssh -N -L /tmp/tetherd-remote.sock:/tmp/tetherd.sock user@daemon-host
+# Forward the remote socket onto your local filesystem (one-time per session).
+ssh -N -L /tmp/tetherd-remote.sock:/tmp/tetherd.sock user@daemon-host &
 tether -s /tmp/tetherd-remote.sock status
 ```
+
+Don't waste effort on socat bridges; native TCP is simpler and the wire
+protocol is identical.
 
 ## Worked example
 

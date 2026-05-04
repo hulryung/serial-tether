@@ -346,16 +346,20 @@ If the device drops, in-flight `expect`/`run` requests fail with `-32005 device_
 ## 11. Debugging
 
 - `tetherd --log-protocol <path>`: dumps every in/out message as `{ts, dir, conn_id, raw}` NDJSON.
-- `socat - UNIX-CONNECT:/run/tetherd.sock` lets you hand-write or eavesdrop on messages.
-- A handy first message: `{"jsonrpc":"2.0","id":1,"method":"hello","params":{"protocol_version":"1","client":{"name":"manual","version":"0","kind":"human"}}}`
+- Talk to the daemon by hand:
+  - **UDS** — `socat - UNIX-CONNECT:/run/tetherd.sock` (or `nc -U` on Linux).
+  - **TCP** — `nc daemon-host 5557` (don't forget to send a valid `auth_token` in the first `hello`).
+- A handy first message:
+  `{"jsonrpc":"2.0","id":1,"method":"hello","params":{"protocol_version":"1","client":{"name":"manual","version":"0","kind":"human"},"auth_token":"<TOKEN_IF_TCP>"}}`
 
 ## 12. Open questions (to be resolved during v1.x)
 
 - **Raw passthrough mode**: a separate connection mode where a human TUI streams keystrokes without wrapping each one in NDJSON. v0 finds plain `send` good enough; we'll add this if throughput becomes an issue.
 - **Multiple devices**: should a single daemon host more than one serial port? v1 assumes a single device. When we add more, a `device_id` field can be added (additive).
 - **Recording / replay**: a separate tool that replays session logs preserving timing (out of protocol scope).
-- **Compression**: optional gzip framing for TCP remote mode. Not needed locally.
+- **TLS for TCP**: v0.4 ships TCP with token-based auth, plaintext on the wire. For untrusted networks, tunnel through SSH/WireGuard or wait for a future `--tls-cert/--tls-key` flag.
+- **Compression**: optional gzip framing for TCP remote mode. Not needed locally; might help on high-latency links once TLS is in place.
 
 ---
 
-**Status**: v1 draft. v1.0 will be cut after PoC feedback is folded in.
+**Status**: v1 draft. TCP transport (§1, §6.1) shipped in v0.4.0. v1.0 will be cut after PoC feedback is folded in.
