@@ -55,6 +55,20 @@ pub async fn hello(
             ),
         ));
     }
+    if conn.requires_auth() {
+        let expected = state.auth_token.as_deref().map(String::as_str);
+        let supplied = p.auth_token.as_deref();
+        let ok = matches!(
+            (expected, supplied),
+            (Some(e), Some(g)) if constant_time_eq(e.as_bytes(), g.as_bytes())
+        );
+        if !ok {
+            return Err(err_with(
+                ErrorCode::Unauthorized,
+                "auth token missing or incorrect",
+            ));
+        }
+    }
     conn.set_initialized(p.client.kind.clone());
     let (head, tail) = state.buffer.snapshot_seqs();
     let result = HelloResult {
@@ -459,6 +473,18 @@ fn find_substring(hay: &[u8], needle: &[u8]) -> Option<(usize, usize)> {
         }
     }
     None
+}
+
+/// Constant-time bytewise comparison to avoid timing leaks on token check.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 /// Strip CSI escapes plus single-character ESC sequences.

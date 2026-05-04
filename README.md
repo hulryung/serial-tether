@@ -30,12 +30,12 @@ brew install hulryung/tether/serial-tether
 
 **`cargo install`** (with a Rust toolchain — works on any platform Rust supports):
 ```sh
-cargo install --git https://github.com/hulryung/serial-tether --tag v0.3.2 serial-tether
+cargo install --git https://github.com/hulryung/serial-tether --tag v0.4.0 serial-tether
 ```
 
 **Pre-built binaries via curl** (no dependencies):
 ```sh
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/hulryung/serial-tether/releases/download/v0.3.2/serial-tether-installer.sh | sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/hulryung/serial-tether/releases/download/v0.4.0/serial-tether-installer.sh | sh
 ```
 
 Or **build from source**:
@@ -49,7 +49,7 @@ cargo build --workspace --release
 ## Quick start
 
 ```sh
-# Terminal 1 — daemon owns the port
+# Terminal 1 — daemon owns the port (default: UDS at /tmp/tetherd.sock)
 tetherd -D /dev/tty.usbserial-XXXX -b 115200
 
 # Terminal 2 — agent / scripted CLI
@@ -58,12 +58,33 @@ tether run "version" -u "# " --literal --timeout-ms 3000 --json
 tether tail
 ```
 
+### Remote daemon (TCP)
+
+To drive a board attached to one host from another machine, start the daemon
+with TCP listening:
+
+```sh
+# On the daemon host:
+tetherd -D /dev/tty.usbserial-XXXX -b 115200 --tcp 0.0.0.0:5557 --auth-token MYSECRET
+
+# (or omit --auth-token to have one generated and printed at startup)
+
+# On the agent host:
+TETHER_AUTH_TOKEN=MYSECRET tether -s tcp://daemon-host:5557 status
+TETHER_AUTH_TOKEN=MYSECRET tether -s tcp://daemon-host:5557 run "version" \
+    --newline crlf -u "# " --literal --timeout-ms 3000 --json
+```
+
+UDS connections are authenticated by the OS (file permissions); TCP
+connections always require a token. Run with both `-s /tmp/tetherd.sock` and
+`--tcp ...` to expose the daemon on both transports simultaneously.
+
 ## The one command an agent should reach for
 
 ```sh
 tether --json run "$cmd" -u "$prompt" --literal --timeout-ms 5000
 # → { matched, match, output (decoded text), truncated, duration_ms, ... }
-# → exit 0 (ok) / 124 (timeout) / 2 (protocol) / 3 (connect) / 4 (device) / 5 (overflow) / 6 (lock)
+# → exit 0 (ok) / 124 (timeout) / 2 (protocol) / 3 (connect) / 4 (device) / 5 (overflow) / 6 (lock) / 7 (unauthorized)
 ```
 
 Agent-friendly defaults are baked in: `--strip-ansi`, `--strip-echo`, `--max-output-bytes 8192`. The `--json` payload includes a decoded `output` field so an LLM never has to deal with base64.
@@ -82,16 +103,17 @@ bash tools/smoke_test.sh
 
 ## Status
 
-v0.2:
+Shipped through v0.4.0:
 - ✅ `hello` / `attach` / `detach` / `send` / `expect` / `run` / `status`
 - ✅ writer lock with `preempt` policy (queue / fail / force)
 - ✅ `strip_ansi` / `strip_echo` / `max_output_bytes` (with truncation marker)
 - ✅ standard exit codes; decoded `output` field in `--json`
 - ✅ `sync` (send CR, wait until idle, surface a prompt candidate)
 - ✅ ring-buffer fan-out with separate consumer / notify cursors per session
+- ✅ TCP transport with token auth (`--tcp HOST:PORT --auth-token …`)
+- ✅ Single daemon can listen on UDS and TCP simultaneously
 
-Not yet (v0.3+):
-- TCP transport with token auth (work around with SSH socket forwarding for now)
+Not yet:
 - Windows Named Pipe backend
 - `tether-tui` (interactive client with raw mode + escape sequences)
 - 30-second session resume after disconnect

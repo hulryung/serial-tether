@@ -21,6 +21,7 @@ pub enum ErrorCode {
     NotInitialized = -32011,
     SessionNotFound = -32012,
     ModeConflict = -32013,
+    Unauthorized = -32014,
 
     Cancelled = -32800,
 }
@@ -47,6 +48,7 @@ impl ErrorCode {
             Self::NotInitialized => "not initialized",
             Self::SessionNotFound => "session not found",
             Self::ModeConflict => "mode conflict",
+            Self::Unauthorized => "unauthorized",
             Self::Cancelled => "cancelled",
         }
     }

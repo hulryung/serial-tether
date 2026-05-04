@@ -23,4 +23,7 @@ pub struct DaemonState {
     pub sessions: Arc<SessionManager>,
     pub config: SerialConfig,
     pub lock: Arc<WriterLock>,
+    /// Required by clients connecting over a transport with `requires_auth=true`
+    /// (i.e., TCP). `None` means TCP listening is disabled.
+    pub auth_token: Option<Arc<String>>,
 }

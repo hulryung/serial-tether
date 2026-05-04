@@ -15,7 +15,7 @@ use base64::Engine as _;
 use futures::{SinkExt, StreamExt};
 use parking_lot::Mutex;
 use serde_json::Value;
-use tokio::net::UnixStream;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
 use tokio_util::codec::Framed;
 
@@ -31,15 +31,22 @@ pub struct ConnState {
     initialized: Mutex<bool>,
     client_kind: Mutex<Option<String>>,
     sessions: Mutex<HashSet<String>>,
+    /// True for transports that require token authentication (TCP).
+    /// False for transports authenticated by the OS (Unix domain sockets).
+    requires_auth: bool,
 }
 
 impl ConnState {
-    pub fn new() -> Self {
+    pub fn new(requires_auth: bool) -> Self {
         Self {
             initialized: Mutex::new(false),
             client_kind: Mutex::new(None),
             sessions: Mutex::new(HashSet::new()),
+            requires_auth,
         }
+    }
+    pub fn requires_auth(&self) -> bool {
+        self.requires_auth
     }
     pub fn set_initialized(&self, kind: String) {
         *self.initialized.lock() = true;
@@ -62,10 +69,13 @@ impl ConnState {
     }
 }
 
-pub async fn handle(stream: UnixStream, state: DaemonState) -> Result<()> {
+pub async fn handle<S>(stream: S, state: DaemonState, requires_auth: bool) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let framed = Framed::new(stream, NdjsonCodec::new());
     let (mut sink, mut source) = framed.split();
-    let conn = Arc::new(ConnState::new());
+    let conn = Arc::new(ConnState::new(requires_auth));
 
     // Outbound channel — handler tasks and the fan-out task push responses /
     // notifications here.

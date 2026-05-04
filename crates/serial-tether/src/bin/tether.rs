@@ -8,10 +8,10 @@
 //!   4   device disconnected
 //!   5   buffer overflow (`max_bytes` exceeded)
 //!   6   lock contention (`preempt=fail` clash)
+//!   7   unauthorized (TCP auth token missing or wrong)
 //!   124 timeout (coreutils convention)
 
 use std::io::IsTerminal;
-use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -19,7 +19,8 @@ use base64::Engine as _;
 use clap::{Parser, Subcommand};
 use futures::{SinkExt, StreamExt};
 use serde_json::{json, Value};
-use tokio::net::UnixStream;
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::{TcpStream, UnixStream};
 use tokio_util::codec::Framed;
 
 use tether_protocol::message::{ResponsePayload, RpcId};
@@ -31,13 +32,18 @@ use tether_protocol::{
 #[derive(Parser, Debug)]
 #[command(name = "tether", version, about = "tether — non-interactive client for tetherd")]
 struct Cli {
-    /// Daemon Unix socket
+    /// Daemon endpoint. Either a UDS path (e.g. /tmp/tetherd.sock) or
+    /// `tcp://host:port` / `tcp:host:port` for a remote daemon.
     #[arg(short = 's', long, default_value = "/tmp/tetherd.sock", global = true)]
-    socket: PathBuf,
+    socket: String,
 
     /// Emit raw JSON output instead of human-readable form.
     #[arg(long, global = true)]
     json: bool,
+
+    /// Auth token for TCP transport (alternative to TETHER_AUTH_TOKEN env var).
+    #[arg(long, global = true, env = "TETHER_AUTH_TOKEN")]
+    auth_token: Option<String>,
 
     #[command(subcommand)]
     cmd: Cmd,
@@ -118,6 +124,10 @@ fn main() -> ExitCode {
         Err(CliError::DeviceDisconnected) => ExitCode::from(4),
         Err(CliError::BufferOverflow) => ExitCode::from(5),
         Err(CliError::LockContention) => ExitCode::from(6),
+        Err(CliError::Unauthorized(msg)) => {
+            eprintln!("tether: unauthorized: {msg}");
+            ExitCode::from(7)
+        }
         Err(CliError::Protocol(msg)) => {
             eprintln!("protocol error: {msg}");
             ExitCode::from(2)
@@ -135,6 +145,7 @@ enum CliError {
     DeviceDisconnected,
     BufferOverflow,
     LockContention,
+    Unauthorized(String),
     Protocol(String),
     Connection(String),
 }
@@ -145,11 +156,49 @@ impl From<std::io::Error> for CliError {
     }
 }
 
+/// Parse `-s` value into a connection target. Recognized forms:
+///   /path/to/sock       → UDS
+///   tcp://host:port     → TCP
+///   tcp:host:port       → TCP
+fn endpoint_kind(s: &str) -> Endpoint<'_> {
+    if let Some(addr) = s.strip_prefix("tcp://") {
+        Endpoint::Tcp(addr)
+    } else if let Some(addr) = s.strip_prefix("tcp:") {
+        Endpoint::Tcp(addr)
+    } else {
+        Endpoint::Uds(s)
+    }
+}
+
+enum Endpoint<'a> {
+    Uds(&'a str),
+    Tcp(&'a str),
+}
+
 async fn run(cli: Cli) -> Result<(), CliError> {
-    let stream = UnixStream::connect(&cli.socket)
-        .await
-        .map_err(|e| CliError::Connection(format!("connect {:?}: {e}", cli.socket)))?;
-    let mut framed = Framed::new(stream, NdjsonCodec::new());
+    match endpoint_kind(&cli.socket) {
+        Endpoint::Uds(path) => {
+            let stream = UnixStream::connect(path)
+                .await
+                .map_err(|e| CliError::Connection(format!("connect {path:?}: {e}")))?;
+            let framed = Framed::new(stream, NdjsonCodec::new());
+            run_with_stream(framed, cli).await
+        }
+        Endpoint::Tcp(addr) => {
+            let stream = TcpStream::connect(addr)
+                .await
+                .map_err(|e| CliError::Connection(format!("connect tcp:{addr}: {e}")))?;
+            let _ = stream.set_nodelay(true);
+            let framed = Framed::new(stream, NdjsonCodec::new());
+            run_with_stream(framed, cli).await
+        }
+    }
+}
+
+async fn run_with_stream<S>(mut framed: Framed<S, NdjsonCodec>, cli: Cli) -> Result<(), CliError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let mut next_id: i64 = 1;
 
     call(
@@ -163,7 +212,7 @@ async fn run(cli: Cli) -> Result<(), CliError> {
                 version: env!("CARGO_PKG_VERSION").into(),
                 kind: "agent".into(),
             },
-            auth_token: None,
+            auth_token: cli.auth_token.clone(),
         })
         .unwrap(),
     )
@@ -308,11 +357,14 @@ async fn run(cli: Cli) -> Result<(), CliError> {
     Ok(())
 }
 
-async fn attach(
-    framed: &mut Framed<UnixStream, NdjsonCodec>,
+async fn attach<S>(
+    framed: &mut Framed<S, NdjsonCodec>,
     next_id: &mut i64,
     replay: &str,
-) -> Result<String, CliError> {
+) -> Result<String, CliError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let p = AttachParams {
         session_id: None,
         mode: "rw".into(),
@@ -328,12 +380,15 @@ async fn attach(
     Ok(id.to_string())
 }
 
-async fn call(
-    framed: &mut Framed<UnixStream, NdjsonCodec>,
+async fn call<S>(
+    framed: &mut Framed<S, NdjsonCodec>,
     next_id: &mut i64,
     method: &str,
     params: Value,
-) -> Result<Value, CliError> {
+) -> Result<Value, CliError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let id = *next_id;
     *next_id += 1;
     let req = Request::new(RpcId::Number(id), method, params);
@@ -371,15 +426,20 @@ fn map_rpc_error(code: i32, msg: String) -> CliError {
         CliError::BufferOverflow
     } else if code == E::LockContention.as_i32() {
         CliError::LockContention
+    } else if code == E::Unauthorized.as_i32() {
+        CliError::Unauthorized(msg)
     } else {
         CliError::Protocol(format!("rpc {code}: {msg}"))
     }
 }
 
-async fn tail_loop(
-    framed: &mut Framed<UnixStream, NdjsonCodec>,
+async fn tail_loop<S>(
+    framed: &mut Framed<S, NdjsonCodec>,
     session_id: &str,
-) -> Result<(), CliError> {
+) -> Result<(), CliError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     use std::io::Write;
     let mut stdout = std::io::stdout().lock();
     while let Some(item) = framed.next().await {
@@ -405,13 +465,16 @@ async fn tail_loop(
     Ok(())
 }
 
-async fn sync_until_idle(
-    framed: &mut Framed<UnixStream, NdjsonCodec>,
+async fn sync_until_idle<S>(
+    framed: &mut Framed<S, NdjsonCodec>,
     next_id: &mut i64,
     session_id: &str,
     idle_ms: u32,
     timeout_ms: u32,
-) -> Result<String, CliError> {
+) -> Result<String, CliError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let started = std::time::Instant::now();
     let timeout_total = Duration::from_millis(timeout_ms as u64);
     let idle = Duration::from_millis(idle_ms as u64);

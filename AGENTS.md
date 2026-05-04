@@ -54,6 +54,7 @@ non-UTF-8 boards).
  4   device disconnected            (USB unplugged, etc.)
  5   buffer overflow                (--max-bytes hit without a match)
  6   lock contention                (--preempt=fail and someone else holds the lock)
+ 7   unauthorized                   (TCP transport: --auth-token missing or wrong)
  124 timeout                        (no match within --timeout-ms)
 ```
 
@@ -155,19 +156,29 @@ whatever the board accepts.
 
 ## Remote daemons (over a network)
 
-Native TCP transport ships in v0.3+ release tracks. Until then, use SSH or
-socat to bridge the daemon's UDS:
+Native TCP transport with token auth shipped in v0.4.0:
 
 ```sh
-# On the daemon host:
-socat TCP-LISTEN:5557,reuseaddr,fork UNIX-CONNECT:/tmp/tetherd.sock
+# Daemon host (board operator):
+tetherd -D /dev/tty.usbserial-XXXX --tcp 0.0.0.0:5557 --auth-token MYSECRET
 
-# On the agent host:
-socat UNIX-LISTEN:/tmp/tetherd.sock,fork,reuseaddr,unlink-early TCP:DAEMON_HOST:5557
-tether -s /tmp/tetherd.sock status
+# Agent host (you):
+export TETHER_AUTH_TOKEN=MYSECRET
+tether -s tcp://daemon-host:5557 status
+tether -s tcp://daemon-host:5557 run "version" --newline crlf -u "# " --literal
 ```
 
-The wire protocol is location-independent; clients don't care.
+UDS still works for local connections (OS-level auth via file permissions).
+Daemons can listen on both transports at once.
+
+If you can't change the daemon, you can still bridge an old daemon's UDS over
+SSH:
+
+```sh
+# Forward the remote socket onto your local filesystem.
+ssh -N -L /tmp/tetherd-remote.sock:/tmp/tetherd.sock user@daemon-host
+tether -s /tmp/tetherd-remote.sock status
+```
 
 ## Worked example
 
