@@ -1,0 +1,105 @@
+name: Publish to crates.io
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to publish (e.g. v0.5.0). Defaults to the most recent tag.'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Verify tag matches workspace version
+        id: version
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          if [ -n "${{ github.event.inputs.tag }}" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+          fi
+          TAG_VER="${TAG#v}"
+          PKG_VER=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name=="serial-tether") | .version')
+          echo "tag=$TAG_VER pkg=$PKG_VER"
+          if [ "$TAG_VER" != "$PKG_VER" ]; then
+            echo "::error::tag $TAG_VER does not match Cargo.toml version $PKG_VER"
+            exit 1
+          fi
+          echo "version=$PKG_VER" >> "$GITHUB_OUTPUT"
+
+      - name: Publish tether-protocol
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        run: |
+          set +e
+          OUT=$(cargo publish -p tether-protocol 2>&1)
+          EC=$?
+          echo "$OUT"
+          if [ $EC -eq 0 ]; then
+            exit 0
+          fi
+          # Treat "already published" as a soft skip — re-running the workflow shouldn't fail.
+          if echo "$OUT" | grep -qi "already exists\|already uploaded\|crate version .* is already uploaded"; then
+            echo "::notice::tether-protocol ${{ steps.version.outputs.version }} already on crates.io; skipping"
+            exit 0
+          fi
+          exit $EC
+
+      - name: Wait for tether-protocol to appear in the crates.io index
+        run: |
+          VER=${{ steps.version.outputs.version }}
+          for i in $(seq 1 30); do
+            # Hit the sparse index directly so we don't depend on cargo cache.
+            META=$(curl -sfL "https://index.crates.io/te/th/tether-protocol" || true)
+            if echo "$META" | jq -r '.vers' 2>/dev/null | grep -qx "$VER"; then
+              echo "tether-protocol $VER visible in index after ${i} attempt(s)"
+              exit 0
+            fi
+            echo "  waiting... ($i/30)"
+            sleep 10
+          done
+          echo "::warning::index propagation slow; trying serial-tether publish anyway"
+
+      - name: Publish serial-tether
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        run: |
+          set +e
+          OUT=$(cargo publish -p serial-tether 2>&1)
+          EC=$?
+          echo "$OUT"
+          if [ $EC -eq 0 ]; then
+            exit 0
+          fi
+          if echo "$OUT" | grep -qi "already exists\|already uploaded\|crate version .* is already uploaded"; then
+            echo "::notice::serial-tether ${{ steps.version.outputs.version }} already on crates.io; skipping"
+            exit 0
+          fi
+          exit $EC
+
+      - name: Summary
+        run: |
+          VER=${{ steps.version.outputs.version }}
+          echo "### crates.io publish — v$VER" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "* tether-protocol: <https://crates.io/crates/tether-protocol/$VER>" >> "$GITHUB_STEP_SUMMARY"
+          echo "* serial-tether:  <https://crates.io/crates/serial-tether/$VER>" >> "$GITHUB_STEP_SUMMARY"
