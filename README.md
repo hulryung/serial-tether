@@ -52,6 +52,8 @@ In one line: **modern, AI-friendly, multi-tenant access to the serial port
 across the whole spectrum of embedded development, without taking the port
 away from the engineers who have always lived inside it.**
 
+![Serial Tether usage model — same serial port, shared by humans and AI in real time](assets/usage-model.png)
+
 ## Components
 
 The `serial-tether` package ships two binaries:
