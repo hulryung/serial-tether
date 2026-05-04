@@ -1,0 +1,416 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Serial Tether — share any serial port, anywhere</title>
+<meta name="description" content="A daemon and CLI that lets AI agents and humans share a single serial device. Race-free RPC, raw-mode shell, UDS or TCP, cross-platform.">
+<meta property="og:title" content="Serial Tether">
+<meta property="og:description" content="One serial port. One daemon. Many clients. Designed for the era when both an AI agent and a human want to drive the same dev board.">
+<meta property="og:image" content="https://github.com/hulryung/serial-tether/raw/main/assets/og.png">
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://hulryung.github.io/serial-tether/">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://github.com/hulryung/serial-tether/raw/main/assets/og.png">
+
+<style>
+  :root {
+    --bg:        #0d1117;
+    --bg-soft:   #161b22;
+    --bg-card:   #1f2937;
+    --border:    #30363d;
+    --fg:        #e6edf3;
+    --muted:     #8b949e;
+    --link:      #4493f8;
+    --link-hov:  #79c0ff;
+    --accent:    #f78166;
+    --green:     #3fb950;
+    --purple:    #d2a8ff;
+    --maxw:      1080px;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, 'Helvetica Neue', sans-serif;
+    line-height: 1.65;
+    font-size: 17px;
+  }
+  a { color: var(--link); text-decoration: none; }
+  a:hover { color: var(--link-hov); text-decoration: underline; }
+  code, pre, kbd { font-family: ui-monospace, 'SF Mono', Menlo, Consolas, monospace; }
+  code { background: var(--bg-soft); padding: 2px 6px; border-radius: 4px; font-size: 0.92em; color: #c9d1d9; }
+  pre {
+    background: var(--bg-soft);
+    border: 1px solid var(--border);
+    padding: 16px 18px;
+    border-radius: 8px;
+    overflow-x: auto;
+    font-size: 0.95em;
+    line-height: 1.55;
+  }
+  pre code { background: transparent; padding: 0; color: var(--fg); font-size: inherit; }
+  h1, h2, h3 { letter-spacing: -0.01em; }
+  h2 { font-size: 1.6em; margin-top: 0; }
+  hr { border: none; border-top: 1px solid var(--border); margin: 64px 0; }
+
+  /* layout */
+  .wrap { max-width: var(--maxw); margin: 0 auto; padding: 0 24px; }
+  section { padding: 56px 0; }
+  section + section { padding-top: 0; }
+
+  /* hero */
+  .hero {
+    text-align: center;
+    padding: 48px 0 24px;
+  }
+  .hero img.banner {
+    width: 100%;
+    max-width: 1200px;
+    border-radius: 12px;
+    border: 1px solid var(--border);
+    margin-bottom: 32px;
+  }
+  .hero h1 {
+    font-size: 2.6em;
+    margin: 0.2em 0 0.3em;
+    letter-spacing: -0.02em;
+  }
+  .hero .tag {
+    color: var(--muted);
+    font-size: 1.2em;
+    max-width: 720px;
+    margin: 0 auto 28px;
+  }
+  .cta {
+    display: inline-flex;
+    gap: 12px;
+    flex-wrap: wrap;
+    justify-content: center;
+  }
+  .btn {
+    display: inline-block;
+    padding: 12px 22px;
+    border-radius: 8px;
+    font-weight: 600;
+    border: 1px solid var(--border);
+    color: var(--fg);
+    background: var(--bg-soft);
+    text-decoration: none;
+    transition: border-color .15s, background .15s;
+  }
+  .btn:hover { border-color: var(--link); text-decoration: none; }
+  .btn.primary { background: var(--link); border-color: var(--link); color: #fff; }
+  .btn.primary:hover { background: #1f6feb; border-color: #1f6feb; }
+
+  /* feature grid */
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 16px;
+    margin-top: 24px;
+  }
+  .card {
+    background: var(--bg-soft);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 20px 22px;
+  }
+  .card h3 {
+    margin: 0 0 6px;
+    font-size: 1.05em;
+    color: var(--link-hov);
+    font-weight: 600;
+  }
+  .card p {
+    margin: 0;
+    color: var(--muted);
+    font-size: 0.95em;
+    line-height: 1.55;
+  }
+
+  /* install tabs */
+  .install {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    gap: 14px;
+  }
+  .install .card h3 { color: var(--accent); }
+
+  /* doc cards */
+  .doc-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    gap: 14px;
+  }
+  .doc-grid a.card { color: var(--fg); text-decoration: none; }
+  .doc-grid a.card h3 { color: var(--link); }
+  .doc-grid a.card:hover { border-color: var(--link); text-decoration: none; }
+
+  /* image with caption */
+  figure {
+    margin: 32px 0 0;
+    text-align: center;
+  }
+  figure img {
+    max-width: 100%;
+    border-radius: 10px;
+    border: 1px solid var(--border);
+  }
+  figure figcaption {
+    color: var(--muted);
+    font-size: 0.9em;
+    margin-top: 10px;
+  }
+
+  /* footer */
+  footer {
+    border-top: 1px solid var(--border);
+    padding: 32px 0 56px;
+    color: var(--muted);
+    font-size: 0.95em;
+    text-align: center;
+  }
+  footer a { color: var(--muted); }
+  footer a:hover { color: var(--link); }
+
+  /* dim numerical badges */
+  .badge {
+    display: inline-block;
+    padding: 2px 8px;
+    margin-left: 6px;
+    border-radius: 999px;
+    background: var(--bg-card);
+    color: var(--muted);
+    font-size: 0.78em;
+    font-weight: 600;
+    vertical-align: middle;
+  }
+
+  /* prose readability */
+  p { color: var(--fg); }
+  p.muted { color: var(--muted); }
+
+  /* responsive */
+  @media (max-width: 600px) {
+    .hero h1 { font-size: 1.9em; }
+    .hero .tag { font-size: 1.05em; }
+    body { font-size: 16px; }
+  }
+</style>
+</head>
+<body>
+
+<section class="hero wrap">
+  <img class="banner"
+       src="https://github.com/hulryung/serial-tether/raw/main/assets/banner.png"
+       alt="Serial Tether — share any serial port, anywhere">
+  <h1>Serial Tether</h1>
+  <p class="tag">
+    A daemon and CLI that lets AI agents and humans share a single serial
+    device. Race-free RPC, raw-mode shell, UDS or TCP, cross-platform.
+  </p>
+  <p class="cta">
+    <a class="btn primary" href="https://github.com/hulryung/serial-tether">View on GitHub</a>
+    <a class="btn" href="#install">Install</a>
+    <a class="btn" href="https://github.com/hulryung/serial-tether/blob/main/docs/OVERVIEW.md">How it works</a>
+  </p>
+</section>
+
+<section class="wrap">
+  <h2>Why</h2>
+  <p>
+    Embedded development means a lot of staring at a serial console — kicking
+    a bootloader, reading kernel logs, exercising firmware against a corner
+    case. Increasingly an AI coding agent wants to do that staring too:
+    react to a stack trace, set a U-Boot env var, drive a board through a
+    regression suite. The naïve loop — <em>agent describes a command in
+    chat &rarr; human copies it into <code>tio</code> &rarr; human pastes
+    the output back</em> — is slow, brittle, and pointless.
+  </p>
+  <p>
+    Serial Tether's job is to hand that loop directly to the agent
+    <strong>without elbowing the human out</strong>. The daemon takes
+    ownership of <code>/dev/ttyUSB0</code> once. From there, three audiences
+    share the same port at the same time:
+  </p>
+
+  <div class="grid">
+    <div class="card">
+      <h3>AI agents</h3>
+      <p>
+        Transactional, structured, bounded RPC. Race-free <code>run</code>,
+        ANSI- and echo-stripped <code>output</code>, standard exit codes,
+        configurable length truncation that protects LLM context budgets.
+      </p>
+    </div>
+    <div class="card">
+      <h3>Humans</h3>
+      <p>
+        A <code>tio</code>-style raw-mode shell, plus <code>tail</code> to
+        watch every byte the agent sends or receives. No "agent mode" that
+        locks the operator out — the human gets a god's-eye view.
+      </p>
+    </div>
+    <div class="card">
+      <h3>Scripts &amp; CI</h3>
+      <p>
+        Shell-friendly exit codes (124 timeout, 7 unauthorized, 4 device gone,
+        …), JSON output with a decoded text field. Same wire whether the
+        daemon is local, behind SSH, or on a VM across the room.
+      </p>
+    </div>
+  </div>
+
+  <figure>
+    <img src="https://github.com/hulryung/serial-tether/raw/main/assets/usage-model.png"
+         alt="Usage model: human and AI assistant viewing the same serial stream in real time">
+    <figcaption>One serial port. Real-time, bi-directional access for both humans and AI.</figcaption>
+  </figure>
+</section>
+
+<section id="install" class="wrap">
+  <h2>Install</h2>
+  <p class="muted">All four paths give you the same two binaries: <code>tetherd</code> (daemon) and <code>tether</code> (client).</p>
+  <div class="install">
+    <div class="card">
+      <h3>Homebrew</h3>
+      <p style="margin-bottom: 12px;">macOS or Linuxbrew — no Rust toolchain needed.</p>
+<pre><code>brew install hulryung/tether/serial-tether</code></pre>
+    </div>
+    <div class="card">
+      <h3>cargo install</h3>
+      <p style="margin-bottom: 12px;">Anywhere Rust runs.</p>
+<pre><code>cargo install serial-tether</code></pre>
+    </div>
+    <div class="card">
+      <h3>curl installer</h3>
+      <p style="margin-bottom: 12px;">Pre-built tar.xz, no dependencies.</p>
+<pre><code>curl -fsSL https://github.com/hulryung/serial-tether/releases/latest/download/serial-tether-installer.sh | sh</code></pre>
+    </div>
+    <div class="card">
+      <h3>Build from source</h3>
+      <p style="margin-bottom: 12px;">Clone and <code>cargo build --release</code>.</p>
+<pre><code>git clone https://github.com/hulryung/serial-tether
+cd serial-tether
+cargo build --workspace --release</code></pre>
+    </div>
+  </div>
+</section>
+
+<section class="wrap">
+  <h2>Quick start</h2>
+  <p>Open one terminal for the daemon, another for the client.</p>
+
+<pre><code><span style="color:var(--muted)"># Terminal 1 — daemon owns the serial port</span>
+tetherd -D /dev/tty.usbserial-XXXX -b 115200 --tcp
+<span style="color:var(--muted)"># banner prints reachable IPs and an auto-generated auth token</span>
+
+<span style="color:var(--muted)"># Terminal 2 — drop into a tio-style interactive shell</span>
+tether
+<span style="color:var(--muted)"># Ctrl-A then Q to quit</span>
+
+<span style="color:var(--muted)"># Or, for an AI agent / shell script:</span>
+tether --json run "version" --newline crlf -u "ASAD SOC =&gt; " --literal --timeout-ms 3000
+
+<span style="color:var(--muted)"># Or, from a remote host (lima VM, CI runner, your laptop):</span>
+TETHER_AUTH_TOKEN=&lt;token-from-banner&gt; \
+  tether -s tcp://daemon-host:5557 status</code></pre>
+
+  <p style="margin-top: 18px; color: var(--muted);">
+    If the daemon isn't running, <code>tether</code> tells you exactly how to
+    start one. Friendly errors all the way down.
+  </p>
+</section>
+
+<section class="wrap">
+  <h2>Highlights</h2>
+  <div class="grid">
+    <div class="card">
+      <h3>Race-free transactions</h3>
+      <p>
+        <code>run</code> acquires a writer-lock at the daemon, captures the
+        ring-buffer head <em>before</em> the write, and matches starting
+        from there. No client-side composition of <code>send</code> +
+        <code>expect</code>.
+      </p>
+    </div>
+    <div class="card">
+      <h3>Two cursors per session</h3>
+      <p>
+        <code>consumer_cursor</code> for matched RPC responses and
+        <code>notify_cursor</code> for live <code>data</code> push are
+        independent — a tail can watch while a run matches, no race.
+      </p>
+    </div>
+    <div class="card">
+      <h3>Auto-reconnect</h3>
+      <p>
+        Daemon retries the device with backoff if the USB hiccups; clients
+        can pass <code>--auto-reconnect</code> to retry their failed RPC
+        once after the daemon recovers.
+      </p>
+    </div>
+    <div class="card">
+      <h3>Cross-machine</h3>
+      <p>
+        Native TCP transport with token auth. Same wire format as UDS.
+        <code>tetherd</code> can listen on both at once.
+      </p>
+    </div>
+    <div class="card">
+      <h3>Plain JSON-RPC over NDJSON</h3>
+      <p>
+        <code>socat</code>- and <code>nc</code>-debuggable. No codegen, no
+        schema files. Per-request <code>--log-protocol</code> dump on the
+        daemon side.
+      </p>
+    </div>
+    <div class="card">
+      <h3>Agent-friendly defaults</h3>
+      <p>
+        <code>--strip-ansi</code>, <code>--strip-echo</code>,
+        <code>--max-output-bytes 8192</code>, exit codes you can branch on
+        in shell. JSON has a decoded <code>output</code> field — no base64.
+      </p>
+    </div>
+  </div>
+</section>
+
+<section class="wrap">
+  <h2>Documentation</h2>
+  <div class="doc-grid">
+    <a class="card" href="https://github.com/hulryung/serial-tether/blob/main/docs/OVERVIEW.md">
+      <h3>OVERVIEW &rarr;</h3>
+      <p>Concepts, architecture, mental model, and design rationale. Read this first.</p>
+    </a>
+    <a class="card" href="https://github.com/hulryung/serial-tether/blob/main/docs/AGENT_USAGE.md">
+      <h3>Agent Usage &rarr;</h3>
+      <p>One-page command cookbook for AI agents — exit codes, JSON shape, race-free patterns, common pitfalls.</p>
+    </a>
+    <a class="card" href="https://github.com/hulryung/serial-tether/blob/main/docs/PROTOCOL.md">
+      <h3>Wire Protocol &rarr;</h3>
+      <p>JSON-RPC 2.0 over NDJSON specification, v1 draft. Methods, notifications, error codes.</p>
+    </a>
+    <a class="card" href="https://github.com/hulryung/serial-tether/tree/main/examples">
+      <h3>Examples &rarr;</h3>
+      <p>Five working Bash automation scripts: U-Boot bdinfo, set-and-verify env, parse help, wait for boot, detect shell.</p>
+    </a>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <p>
+      Released under <a href="https://github.com/hulryung/serial-tether/blob/main/LICENSE-MIT">MIT</a>
+      OR <a href="https://github.com/hulryung/serial-tether/blob/main/LICENSE-APACHE">Apache-2.0</a>.
+      Source on <a href="https://github.com/hulryung/serial-tether">GitHub</a>.
+      Crates: <a href="https://crates.io/crates/serial-tether">serial-tether</a> ·
+      <a href="https://crates.io/crates/tether-protocol">tether-protocol</a>.
+    </p>
+  </div>
+</footer>
+
+</body>
+</html>
