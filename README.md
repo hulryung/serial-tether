@@ -94,7 +94,7 @@ cargo install serial-tether
 
 **Pre-built binaries via curl** (no dependencies):
 ```sh
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/hulryung/serial-tether/releases/download/v0.5.0/serial-tether-installer.sh | sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/hulryung/serial-tether/releases/download/v0.6.0/serial-tether-installer.sh | sh
 ```
 
 Or **build from source**:
@@ -172,7 +172,7 @@ bash tools/smoke_test.sh
 
 ## Status
 
-Shipped through v0.5.0:
+Shipped through v0.6.0:
 - ✅ `hello` / `attach` / `detach` / `send` / `expect` / `run` / `status`
 - ✅ writer lock with `preempt` policy (queue / fail / force)
 - ✅ `strip_ansi` / `strip_echo` / `max_output_bytes` (with truncation marker)
@@ -185,6 +185,10 @@ Shipped through v0.5.0:
 - ✅ `tether shell` — interactive raw-mode client (Ctrl-A then Q to quit)
 - ✅ `tether` (no subcommand) drops into the shell
 - ✅ Friendly error when the daemon isn't running (with the command to start one)
+- ✅ Auto-reconnect on the daemon side when the device disappears (USB unplug, etc.)
+- ✅ `tether reconnect` RPC + `--auto-reconnect` client flag for retry-on-disconnect
+- ✅ `device` notifications (disconnected / reconnected) shown in `tail` and `shell`
+- ✅ Standalone mode: `tether -D /dev/ttyUSB0` auto-spawns a private daemon
 
 Not yet:
 - Windows Named Pipe backend

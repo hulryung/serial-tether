@@ -81,6 +81,6 @@
   <!-- footer -->
   <g font-size="20" fill="#8b949e">
     <text x="60" y="585">github.com/hulryung/serial-tether</text>
-    <text x="1140" y="585" text-anchor="end" fill="#f78166" font-weight="600">v0.5.0</text>
+    <text x="1140" y="585" text-anchor="end" fill="#f78166" font-weight="600">v0.6.0</text>
   </g>
 </svg>
