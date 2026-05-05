@@ -59,7 +59,9 @@ struct Cli {
     device: Option<String>,
 
     /// Baud rate for standalone mode (only used when `-D` is given).
-    #[arg(short = 'b', long, global = true, default_value_t = 115200)]
+    /// Not `global` so the `config` subcommand can have its own optional
+    /// `--baud` flag for `set_device`.
+    #[arg(short = 'b', long, default_value_t = 115200)]
     baud: u32,
 
     /// If no subcommand is given, drops into the interactive shell.
@@ -137,6 +139,34 @@ enum Cmd {
         /// Replay buffer position when attaching.
         #[arg(long, default_value = "now", value_parser = ["start", "now"])]
         from: String,
+    },
+    /// List serial ports the daemon machine knows about.
+    ///
+    /// AI-agent tip: pass `--json` to get a stable schema. Returns an empty
+    /// `ports` array on platforms that can't enumerate (e.g. restricted
+    /// containers).
+    Ports,
+    /// Show or change the live serial configuration.
+    ///
+    /// With no flags: prints the current device settings.
+    /// With one or more of --baud/--data-bits/--parity/--stop-bits/--flow:
+    /// applies the partial update via `set_device` and prints the new state.
+    Config {
+        /// New baud rate (e.g. 9600, 115200, 921600).
+        #[arg(long)]
+        baud: Option<u32>,
+        /// 5, 6, 7, or 8.
+        #[arg(long, value_parser = clap::value_parser!(u8).range(5..=8))]
+        data_bits: Option<u8>,
+        /// none | odd | even.
+        #[arg(long, value_parser = ["none", "odd", "even"])]
+        parity: Option<String>,
+        /// 1 or 2.
+        #[arg(long, value_parser = clap::value_parser!(u8).range(1..=2))]
+        stop_bits: Option<u8>,
+        /// none | software | hardware.
+        #[arg(long = "flow", value_parser = ["none", "software", "hardware"])]
+        flow_control: Option<String>,
     },
     /// Tell the daemon to drop and reopen the serial device. Useful when
     /// the bus is wedged but the daemon thinks it's still connected.
@@ -557,6 +587,39 @@ where
             shell_loop(framed, session_id).await?;
             return Ok(());
         }
+        Cmd::Ports => {
+            let v = call(&mut framed, &mut next_id, "list_ports", json!({})).await?;
+            print_ports(&v, cli.json);
+        }
+        Cmd::Config {
+            baud,
+            data_bits,
+            parity,
+            stop_bits,
+            flow_control,
+        } => {
+            let any = baud.is_some()
+                || data_bits.is_some()
+                || parity.is_some()
+                || stop_bits.is_some()
+                || flow_control.is_some();
+            if !any {
+                // Read-only: pull current device info from `status`.
+                let v = call(&mut framed, &mut next_id, "status", json!({})).await?;
+                let device = v.get("device").cloned().unwrap_or(json!({}));
+                print_device_config(&device, cli.json);
+            } else {
+                let mut p = serde_json::Map::new();
+                if let Some(v) = baud { p.insert("baud".into(), json!(v)); }
+                if let Some(v) = data_bits { p.insert("data_bits".into(), json!(v)); }
+                if let Some(v) = parity { p.insert("parity".into(), json!(v)); }
+                if let Some(v) = stop_bits { p.insert("stop_bits".into(), json!(v)); }
+                if let Some(v) = flow_control { p.insert("flow_control".into(), json!(v)); }
+                let v = call(&mut framed, &mut next_id, "set_device", Value::Object(p)).await?;
+                let device = v.get("device").cloned().unwrap_or(json!({}));
+                print_device_config(&device, cli.json);
+            }
+        }
         Cmd::Reconnect { nowait, timeout_ms } => {
             let v = call(
                 &mut framed,
@@ -823,7 +886,7 @@ where
 
     if is_tty {
         eprint!(
-            "\r\n[tether shell — Ctrl-A then Q to quit, Ctrl-A ? for help]\r\n\r\n"
+            "\r\n[tether shell — Ctrl-A Q quit, Ctrl-A C config, Ctrl-A V ports, Ctrl-A ? help]\r\n\r\n"
         );
     }
 
@@ -839,12 +902,24 @@ where
         }
     });
 
+    // Side channel for RPC responses sent in reaction to in-shell escapes
+    // (Ctrl-A C, Ctrl-A V). Notifications still go to stdout/stderr; responses
+    // are forwarded here so the escape handler can await the result.
+    let (resp_tx, mut resp_rx) = tokio::sync::mpsc::unbounded_channel::<tether_protocol::Response>();
+
     // Reader task: stream `data` notifications for our session straight to
     // stdout, and surface `device` (dis|re)connect events to stderr.
     let target = session_id.clone();
     let reader = tokio::spawn(async move {
         while let Some(item) = source.next().await {
             let Ok(msg) = item else { break };
+            let msg = match msg {
+                Message::Response(r) => {
+                    let _ = resp_tx.send(r);
+                    continue;
+                }
+                other => other,
+            };
             let Message::Notification(Notification { method, params, .. }) = msg else {
                 continue;
             };
@@ -924,9 +999,51 @@ where
     let print_help = || {
         eprint!(
             "\r\n[Ctrl-A Q  : quit]\r\n\
+             [Ctrl-A C  : show serial config]\r\n\
+             [Ctrl-A V  : list available ports]\r\n\
              [Ctrl-A ?  : help]\r\n\
              [Ctrl-A ^A : send literal Ctrl-A]\r\n\r\n"
         );
+    };
+
+    // Pretty-print a `set_device`-style result inside the raw-mode shell.
+    let print_config_inline = |device: &Value| {
+        let baud = device.get("baud").and_then(|n| n.as_u64()).unwrap_or(0);
+        let data_bits = device.get("data_bits").and_then(|n| n.as_u64()).unwrap_or(8);
+        let parity = device.get("parity").and_then(|s| s.as_str()).unwrap_or("none");
+        let stop_bits = device.get("stop_bits").and_then(|n| n.as_u64()).unwrap_or(1);
+        let flow = device.get("flow_control").and_then(|s| s.as_str()).unwrap_or("none");
+        let parity_letter = parity
+            .chars()
+            .next()
+            .map(|c| c.to_ascii_uppercase())
+            .unwrap_or('?');
+        eprint!(
+            "\r\n[config: {baud} {data_bits}{parity_letter}{stop_bits} flow={flow}]\r\n"
+        );
+    };
+
+    let print_ports_inline = |ports: &[Value]| {
+        if ports.is_empty() {
+            eprint!("\r\n[no serial ports detected]\r\n");
+            return;
+        }
+        eprint!("\r\n[ports]\r\n");
+        for port in ports {
+            let path = port.get("path").and_then(|s| s.as_str()).unwrap_or("?");
+            let kind = port.get("kind").and_then(|s| s.as_str()).unwrap_or("unknown");
+            let desc = port
+                .get("product")
+                .and_then(|s| s.as_str())
+                .or_else(|| port.get("manufacturer").and_then(|s| s.as_str()))
+                .unwrap_or("");
+            if desc.is_empty() {
+                eprint!("  {path}  ({kind})\r\n");
+            } else {
+                eprint!("  {path}  ({kind})  {desc}\r\n");
+            }
+        }
+        eprint!("\r\n");
     };
 
     'main: while let Some(chunk) = stdin_rx.recv().await {
@@ -943,6 +1060,50 @@ where
                     }
                     0x01 => buffer.push(0x01), // literal Ctrl-A
                     b'?' | b'h' | b'H' => print_help(),
+                    b'c' | b'C' => {
+                        // Flush any keystrokes accumulated before the escape so
+                        // they don't get mixed into the post-escape output.
+                        if !buffer.is_empty() {
+                            let _ = send_bytes(&buffer, &mut next_id);
+                            buffer.clear();
+                        }
+                        let id = next_id; next_id += 1;
+                        let req = Request::new(RpcId::Number(id), "status", json!({}));
+                        let _ = msg_tx.send(Message::Request(req));
+                        match recv_response_for(id, &mut resp_rx, std::time::Duration::from_millis(2000)).await {
+                            Some(tether_protocol::message::ResponsePayload::Ok { result }) => {
+                                let device = result.get("device").cloned().unwrap_or(json!({}));
+                                print_config_inline(&device);
+                            }
+                            Some(tether_protocol::message::ResponsePayload::Err { error }) => {
+                                eprint!("\r\n[config error: {}]\r\n", error.message);
+                            }
+                            None => eprint!("\r\n[config: timeout]\r\n"),
+                        }
+                    }
+                    b'v' | b'V' => {
+                        if !buffer.is_empty() {
+                            let _ = send_bytes(&buffer, &mut next_id);
+                            buffer.clear();
+                        }
+                        let id = next_id; next_id += 1;
+                        let req = Request::new(RpcId::Number(id), "list_ports", json!({}));
+                        let _ = msg_tx.send(Message::Request(req));
+                        match recv_response_for(id, &mut resp_rx, std::time::Duration::from_millis(2000)).await {
+                            Some(tether_protocol::message::ResponsePayload::Ok { result }) => {
+                                let empty = Vec::<Value>::new();
+                                let ports = result
+                                    .get("ports")
+                                    .and_then(|p| p.as_array())
+                                    .unwrap_or(&empty);
+                                print_ports_inline(ports);
+                            }
+                            Some(tether_protocol::message::ResponsePayload::Err { error }) => {
+                                eprint!("\r\n[list_ports error: {}]\r\n", error.message);
+                            }
+                            None => eprint!("\r\n[list_ports: timeout]\r\n"),
+                        }
+                    }
                     other => {
                         eprint!("\r\n[unknown escape: Ctrl-A {}]\r\n", other as char);
                     }
@@ -1093,6 +1254,93 @@ fn print_match_result(v: &Value, force_json: bool) {
         summary.push(']');
         eprintln!("{summary}");
     }
+}
+
+/// Pull responses off `resp_rx` until we see one whose id matches the request
+/// we just sent, or `timeout` elapses. Foreign responses (e.g. an in-flight
+/// `send` ack from the shell loop) are discarded. Returns `None` on timeout
+/// or channel close.
+async fn recv_response_for(
+    want_id: i64,
+    resp_rx: &mut tokio::sync::mpsc::UnboundedReceiver<tether_protocol::Response>,
+    timeout: std::time::Duration,
+) -> Option<tether_protocol::message::ResponsePayload> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let remain = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remain.is_zero() {
+            return None;
+        }
+        match tokio::time::timeout(remain, resp_rx.recv()).await {
+            Ok(Some(resp)) => match &resp.id {
+                RpcId::Number(n) if *n == want_id => return Some(resp.payload),
+                _ => continue, // foreign response — keep waiting
+            },
+            _ => return None,
+        }
+    }
+}
+
+fn print_ports(v: &Value, force_json: bool) {
+    if force_json {
+        println!("{}", serde_json::to_string_pretty(v).unwrap_or_default());
+        return;
+    }
+    let empty = Vec::<Value>::new();
+    let ports = v.get("ports").and_then(|p| p.as_array()).unwrap_or(&empty);
+    if ports.is_empty() {
+        eprintln!("(no ports detected)");
+        return;
+    }
+    for port in ports {
+        let path = port.get("path").and_then(|s| s.as_str()).unwrap_or("?");
+        let kind = port.get("kind").and_then(|s| s.as_str()).unwrap_or("unknown");
+        let mut details: Vec<String> = Vec::new();
+        if let Some(s) = port.get("manufacturer").and_then(|s| s.as_str()) {
+            details.push(format!("manufacturer={s}"));
+        }
+        if let Some(s) = port.get("product").and_then(|s| s.as_str()) {
+            details.push(format!("product={s}"));
+        }
+        if let Some(s) = port.get("serial_number").and_then(|s| s.as_str()) {
+            details.push(format!("serial={s}"));
+        }
+        if let (Some(vid), Some(pid)) = (
+            port.get("vid").and_then(|s| s.as_str()),
+            port.get("pid").and_then(|s| s.as_str()),
+        ) {
+            details.push(format!("usb={vid}:{pid}"));
+        }
+        if details.is_empty() {
+            println!("{path}  ({kind})");
+        } else {
+            println!("{path}  ({kind})  {}", details.join(", "));
+        }
+    }
+}
+
+fn print_device_config(device: &Value, force_json: bool) {
+    if force_json {
+        println!("{}", serde_json::to_string_pretty(device).unwrap_or_default());
+        return;
+    }
+    let path = device.get("path").and_then(|s| s.as_str()).unwrap_or("?");
+    let baud = device.get("baud").and_then(|n| n.as_u64()).unwrap_or(0);
+    let data_bits = device.get("data_bits").and_then(|n| n.as_u64()).unwrap_or(8);
+    let parity = device.get("parity").and_then(|s| s.as_str()).unwrap_or("none");
+    let stop_bits = device.get("stop_bits").and_then(|n| n.as_u64()).unwrap_or(1);
+    let flow = device.get("flow_control").and_then(|s| s.as_str()).unwrap_or("none");
+    let connected = device.get("connected").and_then(|b| b.as_bool()).unwrap_or(false);
+    let parity_letter = parity
+        .chars()
+        .next()
+        .map(|c| c.to_ascii_uppercase())
+        .unwrap_or('?');
+    println!("path:         {path}");
+    println!("baud:         {baud}");
+    println!("framing:      {data_bits}{parity_letter}{stop_bits}");
+    println!("flow_control: {flow}");
+    println!("connected:    {connected}");
 }
 
 /// Append a line terminator if requested.

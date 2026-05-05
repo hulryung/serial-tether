@@ -217,6 +217,8 @@ async fn dispatch(
         "expect" => handlers::expect(state, conn, params).await,
         "run" => handlers::run(state, conn, params).await,
         "status" => handlers::status(state, conn, params).await,
+        "list_ports" => handlers::list_ports(state, conn, params).await,
+        "set_device" => handlers::set_device(state, conn, params).await,
         "reconnect" => handlers::reconnect(state, conn, params).await,
         _ => Err(tether_protocol::ProtocolError::new(ErrorCode::MethodNotFound)
             .with_message(format!("method not found: {method}"))),

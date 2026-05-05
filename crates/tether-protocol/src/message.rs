@@ -101,6 +101,8 @@ pub struct DeviceInfo {
     pub parity: String,
     #[serde(default = "default_stop_bits")]
     pub stop_bits: u8,
+    #[serde(default = "default_serial_flow_control")]
+    pub flow_control: String,
     #[serde(default = "default_connected")]
     pub connected: bool,
 }
@@ -108,7 +110,60 @@ pub struct DeviceInfo {
 fn default_data_bits() -> u8 { 8 }
 fn default_parity() -> String { "none".into() }
 fn default_stop_bits() -> u8 { 1 }
+fn default_serial_flow_control() -> String { "none".into() }
 fn default_connected() -> bool { true }
+
+// ---------- list_ports ----------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PortInfo {
+    pub path: String,
+    /// "usb" | "pci" | "bluetooth" | "unknown"
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manufacturer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub product: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serial_number: Option<String>,
+    /// USB Vendor ID, lowercase 4-hex (e.g. "10c4").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vid: Option<String>,
+    /// USB Product ID, lowercase 4-hex.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListPortsResult {
+    pub ports: Vec<PortInfo>,
+}
+
+// ---------- set_device ----------
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SetDeviceParams {
+    /// New baud rate (e.g. 9600, 115200, 921600). Optional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baud: Option<u32>,
+    /// 5..=8. Optional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_bits: Option<u8>,
+    /// "none" | "odd" | "even". Optional. (mark/space not supported by serialport-rs.)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parity: Option<String>,
+    /// 1 or 2. Optional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_bits: Option<u8>,
+    /// "none" | "software" | "hardware". Optional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flow_control: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SetDeviceResult {
+    pub device: DeviceInfo,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BufferInfo {

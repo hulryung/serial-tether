@@ -5,7 +5,7 @@ use parking_lot::Mutex;
 use tokio::sync::{broadcast, Notify};
 
 use crate::buffer::RingBuffer;
-use crate::serial::{SerialConfig, SerialWriter};
+use crate::serial::{SerialConfig, SerialControl, SerialWriter};
 use crate::session::SessionManager;
 
 /// Liveness state of the underlying serial device. The serial task is the
@@ -48,6 +48,9 @@ pub struct DeviceEvent {
 pub enum DeviceEventKind {
     Disconnected,
     Reconnected,
+    /// Live serial settings changed (set_device). The device wasn't dropped;
+    /// `detail` carries a short summary of the new configuration for the UI.
+    ConfigChanged,
 }
 
 impl DeviceEventKind {
@@ -55,6 +58,7 @@ impl DeviceEventKind {
         match self {
             Self::Disconnected => "disconnected",
             Self::Reconnected => "reconnected",
+            Self::ConfigChanged => "config_changed",
         }
     }
 }
@@ -72,8 +76,14 @@ pub struct WriterLock {
 pub struct DaemonState {
     pub buffer: RingBuffer,
     pub writer: SerialWriter,
+    /// Issues live serial-control commands (set_device, send_break, ...) to
+    /// the serial owner task.
+    pub serial_control: SerialControl,
     pub sessions: Arc<SessionManager>,
-    pub config: SerialConfig,
+    /// Shared, mutable serial configuration. The serial owner task is the
+    /// authoritative writer (it updates this after a successful apply); RPC
+    /// handlers read it (status/hello) and propose changes via `serial_control`.
+    pub config: Arc<Mutex<SerialConfig>>,
     pub lock: Arc<WriterLock>,
     /// Required by clients connecting over a transport with `requires_auth=true`
     /// (i.e., TCP). `None` means TCP listening is disabled.

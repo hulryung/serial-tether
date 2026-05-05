@@ -27,6 +27,159 @@ use crate::state::{DeviceEvent, DeviceEventKind, DeviceState};
 pub struct SerialConfig {
     pub path: String,
     pub baud: u32,
+    pub data_bits: DataBits,
+    pub parity: Parity,
+    pub stop_bits: StopBits,
+    pub flow_control: FlowControl,
+}
+
+/// Mirror of tokio_serial / serialport enums, but as our own type so the
+/// protocol crate stays decoupled from serialport-rs version churn and we
+/// can serialise to/from JSON-friendly strings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DataBits { Five, Six, Seven, Eight }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Parity { None, Odd, Even }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopBits { One, Two }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlowControl { None, Software, Hardware }
+
+impl DataBits {
+    #[allow(dead_code)]
+    pub fn as_str(self) -> &'static str {
+        match self { Self::Five => "5", Self::Six => "6", Self::Seven => "7", Self::Eight => "8" }
+    }
+    pub fn as_u8(self) -> u8 {
+        match self { Self::Five => 5, Self::Six => 6, Self::Seven => 7, Self::Eight => 8 }
+    }
+    pub fn from_u8(n: u8) -> Option<Self> {
+        match n { 5 => Some(Self::Five), 6 => Some(Self::Six), 7 => Some(Self::Seven), 8 => Some(Self::Eight), _ => None }
+    }
+    pub fn to_serial(self) -> tokio_serial::DataBits {
+        match self {
+            Self::Five => tokio_serial::DataBits::Five,
+            Self::Six => tokio_serial::DataBits::Six,
+            Self::Seven => tokio_serial::DataBits::Seven,
+            Self::Eight => tokio_serial::DataBits::Eight,
+        }
+    }
+}
+
+impl Parity {
+    pub fn as_str(self) -> &'static str {
+        match self { Self::None => "none", Self::Odd => "odd", Self::Even => "even" }
+    }
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "none" | "n" => Some(Self::None),
+            "odd" | "o" => Some(Self::Odd),
+            "even" | "e" => Some(Self::Even),
+            _ => None,
+        }
+    }
+    pub fn to_serial(self) -> tokio_serial::Parity {
+        match self {
+            Self::None => tokio_serial::Parity::None,
+            Self::Odd => tokio_serial::Parity::Odd,
+            Self::Even => tokio_serial::Parity::Even,
+        }
+    }
+}
+
+impl StopBits {
+    #[allow(dead_code)]
+    pub fn as_str(self) -> &'static str {
+        match self { Self::One => "1", Self::Two => "2" }
+    }
+    pub fn as_u8(self) -> u8 {
+        match self { Self::One => 1, Self::Two => 2 }
+    }
+    pub fn from_u8(n: u8) -> Option<Self> {
+        match n { 1 => Some(Self::One), 2 => Some(Self::Two), _ => None }
+    }
+    pub fn to_serial(self) -> tokio_serial::StopBits {
+        match self {
+            Self::One => tokio_serial::StopBits::One,
+            Self::Two => tokio_serial::StopBits::Two,
+        }
+    }
+}
+
+impl FlowControl {
+    pub fn as_str(self) -> &'static str {
+        match self { Self::None => "none", Self::Software => "software", Self::Hardware => "hardware" }
+    }
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "none" | "off" => Some(Self::None),
+            "software" | "soft" | "xon" | "xon/xoff" => Some(Self::Software),
+            "hardware" | "hard" | "rts/cts" | "rtscts" => Some(Self::Hardware),
+            _ => None,
+        }
+    }
+    pub fn to_serial(self) -> tokio_serial::FlowControl {
+        match self {
+            Self::None => tokio_serial::FlowControl::None,
+            Self::Software => tokio_serial::FlowControl::Software,
+            Self::Hardware => tokio_serial::FlowControl::Hardware,
+        }
+    }
+}
+
+/// Control commands sent into the serial owner task. Used by `set_device`,
+/// (and later v0.8) `set_break`, `set_dtr`, `set_rts`, `read_modem_status`.
+pub enum ControlMsg {
+    Apply {
+        baud: Option<u32>,
+        data_bits: Option<DataBits>,
+        parity: Option<Parity>,
+        stop_bits: Option<StopBits>,
+        flow_control: Option<FlowControl>,
+        ack: tokio::sync::oneshot::Sender<Result<(), std::io::Error>>,
+    },
+}
+
+#[derive(Clone)]
+pub struct SerialControl {
+    tx: mpsc::Sender<ControlMsg>,
+}
+
+impl SerialControl {
+    pub async fn apply(
+        &self,
+        baud: Option<u32>,
+        data_bits: Option<DataBits>,
+        parity: Option<Parity>,
+        stop_bits: Option<StopBits>,
+        flow_control: Option<FlowControl>,
+    ) -> Result<(), std::io::Error> {
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        if self
+            .tx
+            .send(ControlMsg::Apply {
+                baud,
+                data_bits,
+                parity,
+                stop_bits,
+                flow_control,
+                ack: ack_tx,
+            })
+            .await
+            .is_err()
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "serial task gone",
+            ));
+        }
+        ack_rx.await.map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "serial task dropped")
+        })?
+    }
 }
 
 pub enum SerialPort {
@@ -98,7 +251,24 @@ impl SerialPort {
         match tokio_serial::SerialStream::open(
             &tokio_serial::new(&cfg.path, cfg.baud).timeout(Duration::from_millis(0)),
         ) {
-            Ok(s) => Ok(SerialPort::Real(s)),
+            Ok(mut s) => {
+                // termios-capable backend: apply the full config so a non-default
+                // data_bits/parity/stop_bits/flow_control sticks across reconnects.
+                use tokio_serial::SerialPort as _;
+                if let Err(e) = s.set_data_bits(cfg.data_bits.to_serial()) {
+                    tracing::warn!(error=%e, "set_data_bits failed (continuing)");
+                }
+                if let Err(e) = s.set_parity(cfg.parity.to_serial()) {
+                    tracing::warn!(error=%e, "set_parity failed (continuing)");
+                }
+                if let Err(e) = s.set_stop_bits(cfg.stop_bits.to_serial()) {
+                    tracing::warn!(error=%e, "set_stop_bits failed (continuing)");
+                }
+                if let Err(e) = s.set_flow_control(cfg.flow_control.to_serial()) {
+                    tracing::warn!(error=%e, "set_flow_control failed (continuing)");
+                }
+                Ok(SerialPort::Real(s))
+            }
             Err(e) => {
                 tracing::warn!(
                     path = %cfg.path, error = %e,
@@ -146,18 +316,23 @@ impl SerialWriter {
 /// Spawn the serial owner task. The task runs forever, reconnecting whenever
 /// the device disappears (EOF, error, or `force_reconnect`).
 ///
-/// Returns the writer handle. Callers update `state` and trigger
-/// `force_reconnect` from the outside (e.g., the `reconnect` RPC).
+/// `cfg` is shared mutable state: the owner task is the authoritative writer
+/// (it stores a successful Apply back here so the next reconnect uses the
+/// updated settings); other code reads it for `status` / `hello`.
+///
+/// Returns (writer, control, join_handle).
 pub fn spawn(
-    cfg: SerialConfig,
+    cfg: Arc<Mutex<SerialConfig>>,
     buffer: RingBuffer,
     state: Arc<Mutex<DeviceState>>,
     force_reconnect: Arc<Notify>,
     reconnected: Arc<Notify>,
     device_events: broadcast::Sender<DeviceEvent>,
-) -> (SerialWriter, tokio::task::JoinHandle<()>) {
+) -> (SerialWriter, SerialControl, tokio::task::JoinHandle<()>) {
     let (tx, mut rx) = mpsc::channel::<WriteJob>(64);
     let writer = SerialWriter { tx };
+    let (ctrl_tx, mut ctrl_rx) = mpsc::channel::<ControlMsg>(8);
+    let control = SerialControl { tx: ctrl_tx };
 
     let handle = tokio::spawn(async move {
         let initial_backoff = Duration::from_millis(500);
@@ -170,12 +345,15 @@ pub fn spawn(
         let mut emit_disconnect = false;
 
         loop {
+            // Snapshot the latest config before each open, so a `set_device`
+            // applied while we were waiting to reconnect actually takes effect.
+            let snapshot = cfg.lock().clone();
             // Try to open the device. While in retry, drain pending write
             // jobs immediately with a NotConnected error so clients don't wait.
             let port = loop {
-                match SerialPort::open(&cfg).await {
+                match SerialPort::open(&snapshot).await {
                     Ok(p) => {
-                        tracing::info!(path = %cfg.path, "serial opened");
+                        tracing::info!(path = %snapshot.path, "serial opened");
                         let was_connected = {
                             let mut s = state.lock();
                             let prev = s.connected;
@@ -200,7 +378,7 @@ pub fn spawn(
                     Err(e) => {
                         let reason = format!("{e}");
                         tracing::warn!(
-                            path = %cfg.path, error = %reason,
+                            path = %snapshot.path, error = %reason,
                             backoff_ms = backoff.as_millis() as u64,
                             "serial open failed; will retry"
                         );
@@ -211,7 +389,9 @@ pub fn spawn(
                             s.consecutive_open_failures += 1;
                         }
                         // While waiting, fail any pending writes immediately
-                        // and react to a force_reconnect kick.
+                        // and react to a force_reconnect kick. Control messages
+                        // mutate the shared config and request a reconnect so
+                        // the next open uses the new settings.
                         let sleep = tokio::time::sleep(backoff);
                         tokio::pin!(sleep);
                         loop {
@@ -224,6 +404,21 @@ pub fn spawn(
                                         "device disconnected",
                                     )));
                                 }
+                                Some(msg) = ctrl_rx.recv() => {
+                                    let ControlMsg::Apply { baud, data_bits, parity, stop_bits, flow_control, ack } = msg;
+                                    {
+                                        let mut c = cfg.lock();
+                                        if let Some(v) = baud { c.baud = v; }
+                                        if let Some(v) = data_bits { c.data_bits = v; }
+                                        if let Some(v) = parity { c.parity = v; }
+                                        if let Some(v) = stop_bits { c.stop_bits = v; }
+                                        if let Some(v) = flow_control { c.flow_control = v; }
+                                    }
+                                    let _ = ack.send(Ok(()));
+                                    // Restart the open loop with the new config
+                                    // immediately rather than waiting for backoff.
+                                    break;
+                                }
                             }
                         }
                         backoff = (backoff * 2).min(max_backoff);
@@ -234,7 +429,15 @@ pub fn spawn(
 
             // Run one IO session with the open port. Returns a string reason
             // explaining why we exited (EOF, write error, force, etc.).
-            let reason = run_io_session(port, &buffer, &mut rx, &force_reconnect).await;
+            let reason = run_io_session(
+                port,
+                &buffer,
+                &mut rx,
+                &mut ctrl_rx,
+                &cfg,
+                &force_reconnect,
+            )
+            .await;
             tracing::warn!(reason = %reason, "serial session ended");
             {
                 let mut s = state.lock();
@@ -254,7 +457,40 @@ pub fn spawn(
         }
     });
 
-    (writer, handle)
+    (writer, control, handle)
+}
+
+/// Apply a (partial) settings update to the live `tokio_serial::SerialStream`.
+/// Returns the first error encountered, or Ok if every requested change took.
+fn apply_to_real(
+    s: &mut tokio_serial::SerialStream,
+    baud: Option<u32>,
+    data_bits: Option<DataBits>,
+    parity: Option<Parity>,
+    stop_bits: Option<StopBits>,
+    flow_control: Option<FlowControl>,
+) -> std::io::Result<()> {
+    use tokio_serial::SerialPort as _;
+    if let Some(v) = baud {
+        s.set_baud_rate(v).map_err(serialport_to_io)?;
+    }
+    if let Some(v) = data_bits {
+        s.set_data_bits(v.to_serial()).map_err(serialport_to_io)?;
+    }
+    if let Some(v) = parity {
+        s.set_parity(v.to_serial()).map_err(serialport_to_io)?;
+    }
+    if let Some(v) = stop_bits {
+        s.set_stop_bits(v.to_serial()).map_err(serialport_to_io)?;
+    }
+    if let Some(v) = flow_control {
+        s.set_flow_control(v.to_serial()).map_err(serialport_to_io)?;
+    }
+    Ok(())
+}
+
+fn serialport_to_io(e: tokio_serial::Error) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
 }
 
 /// Per-session IO loop. Returns when the device disconnects (or we're forced
@@ -263,6 +499,8 @@ async fn run_io_session(
     port: SerialPort,
     buffer: &RingBuffer,
     rx: &mut mpsc::Receiver<WriteJob>,
+    ctrl_rx: &mut mpsc::Receiver<ControlMsg>,
+    cfg: &Arc<Mutex<SerialConfig>>,
     force_reconnect: &Notify,
 ) -> String {
     match port {
@@ -272,6 +510,24 @@ async fn run_io_session(
                 tokio::select! {
                     biased;
                     _ = force_reconnect.notified() => return "forced reconnect".to_string(),
+                    msg = ctrl_rx.recv() => {
+                        let Some(msg) = msg else { return "control channel closed".into() };
+                        let ControlMsg::Apply { baud, data_bits, parity, stop_bits, flow_control, ack } = msg;
+                        match apply_to_real(&mut s, baud, data_bits, parity, stop_bits, flow_control) {
+                            Ok(()) => {
+                                {
+                                    let mut c = cfg.lock();
+                                    if let Some(v) = baud { c.baud = v; }
+                                    if let Some(v) = data_bits { c.data_bits = v; }
+                                    if let Some(v) = parity { c.parity = v; }
+                                    if let Some(v) = stop_bits { c.stop_bits = v; }
+                                    if let Some(v) = flow_control { c.flow_control = v; }
+                                }
+                                let _ = ack.send(Ok(()));
+                            }
+                            Err(e) => { let _ = ack.send(Err(e)); }
+                        }
+                    }
                     job = rx.recv() => {
                         let Some(job) = job else { return "writer channel closed".into() };
                         let WriteJob { data, ack } = job;
@@ -299,6 +555,17 @@ async fn run_io_session(
                 tokio::select! {
                     biased;
                     _ = force_reconnect.notified() => return "forced reconnect".to_string(),
+                    msg = ctrl_rx.recv() => {
+                        let Some(msg) = msg else { return "control channel closed".into() };
+                        let ControlMsg::Apply { ack, .. } = msg;
+                        // The Fd backend covers PTYs and pipes that don't accept
+                        // termios changes. Surface this as UnsupportedSerialOp
+                        // to the caller.
+                        let _ = ack.send(Err(std::io::Error::new(
+                            std::io::ErrorKind::Unsupported,
+                            "device does not support runtime serial config changes",
+                        )));
+                    }
                     job = rx.recv() => {
                         let Some(job) = job else { return "writer channel closed".into() };
                         let WriteJob { data, ack } = job;

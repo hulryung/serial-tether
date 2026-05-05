@@ -17,6 +17,8 @@ pub enum ErrorCode {
     DeviceDisconnected = -32005,
     BufferOverflow = -32006,
 
+    UnsupportedSerialOp = -32007,
+    InvalidSerialSetting = -32008,
     UnsupportedProtocol = -32010,
     NotInitialized = -32011,
     SessionNotFound = -32012,
@@ -44,6 +46,8 @@ impl ErrorCode {
             Self::LockContention => "lock contention",
             Self::DeviceDisconnected => "device disconnected",
             Self::BufferOverflow => "buffer overflow",
+            Self::UnsupportedSerialOp => "unsupported serial operation",
+            Self::InvalidSerialSetting => "invalid serial setting",
             Self::UnsupportedProtocol => "unsupported protocol",
             Self::NotInitialized => "not initialized",
             Self::SessionNotFound => "session not found",

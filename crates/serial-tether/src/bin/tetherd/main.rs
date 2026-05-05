@@ -14,7 +14,10 @@ use clap::Parser;
 use tokio::net::{TcpListener, UnixListener};
 
 use crate::buffer::RingBuffer;
-use crate::serial::{SerialConfig, SerialPort};
+use crate::serial::{
+    DataBits as SerialDataBits, FlowControl as SerialFlow, Parity as SerialParity, SerialConfig,
+    SerialPort, StopBits as SerialStopBits,
+};
 use crate::session::SessionManager;
 use crate::state::DaemonState;
 
@@ -28,6 +31,22 @@ struct Args {
     /// Baud rate
     #[arg(short = 'b', long, default_value_t = 115200)]
     baud: u32,
+
+    /// Data bits: 5, 6, 7, or 8.
+    #[arg(long, default_value_t = 8, value_parser = clap::value_parser!(u8).range(5..=8))]
+    data_bits: u8,
+
+    /// Parity: none | odd | even.
+    #[arg(long, default_value = "none")]
+    parity: String,
+
+    /// Stop bits: 1 or 2.
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=2))]
+    stop_bits: u8,
+
+    /// Flow control: none | software | hardware.
+    #[arg(long, default_value = "none")]
+    flow_control: String,
 
     /// Unix socket path. Use --no-uds to disable.
     #[arg(short = 's', long, default_value = "/tmp/tetherd.sock")]
@@ -71,6 +90,18 @@ fn print_banner(args: &Args, tcp_addr: Option<SocketAddr>, auth_token: Option<&s
     eprintln!();
     eprintln!("Serial Tether {}", env!("CARGO_PKG_VERSION"));
     eprintln!("  device     {} @ {} baud", args.device, args.baud);
+    eprintln!(
+        "  framing    {}{}{} flow={}",
+        args.data_bits,
+        match args.parity.to_ascii_lowercase().chars().next() {
+            Some('n') => 'N',
+            Some('o') => 'O',
+            Some('e') => 'E',
+            _ => '?',
+        },
+        args.stop_bits,
+        args.flow_control,
+    );
     eprintln!("  buffer     {} KiB", args.buffer_capacity / 1024);
     if let Some(tok) = auth_token {
         eprintln!("  auth       {tok}");
@@ -169,10 +200,23 @@ async fn main() -> Result<()> {
         anyhow::bail!("--no-uds requires --tcp; otherwise the daemon has no listener");
     }
 
+    let data_bits = SerialDataBits::from_u8(args.data_bits)
+        .ok_or_else(|| anyhow::anyhow!("invalid --data-bits {}", args.data_bits))?;
+    let parity = SerialParity::parse(&args.parity)
+        .ok_or_else(|| anyhow::anyhow!("invalid --parity {:?}", args.parity))?;
+    let stop_bits = SerialStopBits::from_u8(args.stop_bits)
+        .ok_or_else(|| anyhow::anyhow!("invalid --stop-bits {}", args.stop_bits))?;
+    let flow_control = SerialFlow::parse(&args.flow_control)
+        .ok_or_else(|| anyhow::anyhow!("invalid --flow-control {:?}", args.flow_control))?;
     let cfg = SerialConfig {
         path: args.device.clone(),
         baud: args.baud,
+        data_bits,
+        parity,
+        stop_bits,
+        flow_control,
     };
+    let cfg_shared = Arc::new(parking_lot::Mutex::new(cfg.clone()));
 
     let buffer = RingBuffer::new(args.buffer_capacity);
 
@@ -192,8 +236,8 @@ async fn main() -> Result<()> {
     // Capacity 32 is plenty for device transitions; subscribers that fall
     // behind get RecvError::Lagged which conn.rs treats as drop-and-resync.
     let (device_events_tx, _) = tokio::sync::broadcast::channel::<crate::state::DeviceEvent>(32);
-    let (writer, _serial_task) = serial::spawn(
-        cfg.clone(),
+    let (writer, serial_control, _serial_task) = serial::spawn(
+        cfg_shared.clone(),
         buffer.clone(),
         device_state.clone(),
         force_reconnect.clone(),
@@ -219,8 +263,9 @@ async fn main() -> Result<()> {
     let state = DaemonState {
         buffer,
         writer,
+        serial_control,
         sessions: Arc::new(SessionManager::new()),
-        config: cfg,
+        config: cfg_shared,
         lock: Arc::new(crate::state::WriterLock::default()),
         auth_token: auth_token.clone(),
         device_state,

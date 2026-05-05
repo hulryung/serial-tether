@@ -6,7 +6,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
@@ -16,7 +16,7 @@ homepage = "https://github.com/hulryung/serial-tether"
 [workspace.dependencies]
 # Path lets local builds use the in-tree crate; version makes the dependency
 # work for downstream crates.io consumers (and for `cargo publish`).
-tether-protocol = { path = "crates/tether-protocol", version = "0.6.0" }
+tether-protocol = { path = "crates/tether-protocol", version = "0.7.0" }
 
 tokio = { version = "1.40", features = ["full"] }
 tokio-util = { version = "0.7", features = ["codec"] }

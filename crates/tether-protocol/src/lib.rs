@@ -11,8 +11,9 @@ pub use error::{ErrorCode, ProtocolError};
 pub use message::{
     AttachParams, AttachResult, BufferInfo, CancelParams, CancelResult, ClientInfo, DataNotify,
     DetachParams, DeviceInfo, DeviceNotify, ExpectMatch, ExpectParams, ExpectResult, HelloParams,
-    HelloResult, LagNotify, LockNotify, Message, Notification, Request, Response, RunParams,
-    RunResult, SendParams, SendResult, SessionInfo, SessionNotify, StatusResult, UntilSpec,
+    HelloResult, LagNotify, ListPortsResult, LockNotify, Message, Notification, PortInfo, Request,
+    Response, RunParams, RunResult, SendParams, SendResult, SessionInfo, SessionNotify,
+    SetDeviceParams, SetDeviceResult, StatusResult, UntilSpec,
 };
 
 pub const PROTOCOL_VERSION: &str = "1";

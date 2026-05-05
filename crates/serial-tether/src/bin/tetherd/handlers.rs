@@ -8,13 +8,32 @@ use serde_json::{json, Value};
 use tether_protocol::message::LockState;
 use tether_protocol::{
     AttachParams, AttachResult, BufferInfo, DetachParams, DeviceInfo, ExpectMatch, ExpectParams,
-    HelloParams, HelloResult, ProtocolError, RunParams, SendParams, SendResult, StatusResult,
+    HelloParams, HelloResult, ListPortsResult, PortInfo, ProtocolError, RunParams, SendParams,
+    SendResult, SetDeviceParams, SetDeviceResult, StatusResult,
 };
 use tether_protocol::error::ErrorCode;
 
 use crate::conn::ConnState;
+use crate::serial::{
+    DataBits as SerialDataBits, FlowControl as SerialFlow, Parity as SerialParity, SerialConfig,
+    StopBits as SerialStopBits,
+};
 use crate::session::{FlowControl, SessionMode};
 use crate::state::DaemonState;
+
+/// Read a snapshot of the shared serial config and convert it into a wire
+/// `DeviceInfo`. Used by `hello`, `status`, and `set_device`.
+fn device_info_from(cfg: &SerialConfig, connected: bool) -> DeviceInfo {
+    DeviceInfo {
+        path: cfg.path.clone(),
+        baud: cfg.baud,
+        data_bits: cfg.data_bits.as_u8(),
+        parity: cfg.parity.as_str().into(),
+        stop_bits: cfg.stop_bits.as_u8(),
+        flow_control: cfg.flow_control.as_str().into(),
+        connected,
+    }
+}
 
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -83,17 +102,12 @@ pub async fn hello(
     }
     conn.set_initialized(p.client.kind.clone());
     let (head, tail) = state.buffer.snapshot_seqs();
+    let device_connected = state.device_state.lock().connected;
+    let device = device_info_from(&state.config.lock(), device_connected);
     let result = HelloResult {
         server_version: SERVER_VERSION.to_string(),
         protocol_version: tether_protocol::PROTOCOL_VERSION.to_string(),
-        device: DeviceInfo {
-            path: state.config.path.clone(),
-            baud: state.config.baud,
-            data_bits: 8,
-            parity: "none".into(),
-            stop_bits: 1,
-            connected: true,
-        },
+        device,
         buffer: BufferInfo {
             capacity_bytes: state.buffer.capacity() as u64,
             head_seq: head,
@@ -276,15 +290,9 @@ pub async fn status(
     let (head, tail) = state.buffer.snapshot_seqs();
     let holder = state.lock.holder.lock().clone();
     let device_connected = state.device_state.lock().connected;
+    let device = device_info_from(&state.config.lock(), device_connected);
     let result = StatusResult {
-        device: DeviceInfo {
-            path: state.config.path.clone(),
-            baud: state.config.baud,
-            data_bits: 8,
-            parity: "none".into(),
-            stop_bits: 1,
-            connected: device_connected,
-        },
+        device,
         buffer: BufferInfo {
             capacity_bytes: state.buffer.capacity() as u64,
             head_seq: head,
@@ -359,6 +367,166 @@ pub async fn reconnect(
         "reconnected": reconnected_ok,
         "device_connected": device_connected,
     }))
+}
+
+/// Enumerate the serial ports the daemon machine knows about.
+///
+/// Failures of the underlying `serialport::available_ports()` are not fatal:
+/// some platforms (notably Linux without udev metadata, or restricted
+/// containers) refuse to enumerate, and tio's behaviour there is to keep
+/// going rather than error. We log a warning and return an empty array so
+/// AI-agent callers see a stable shape.
+pub async fn list_ports(
+    _state: &DaemonState,
+    _conn: &ConnState,
+    _params: Option<Value>,
+) -> Result<Value, ProtocolError> {
+    let ports = match tokio_serial::available_ports() {
+        Ok(list) => list
+            .into_iter()
+            .map(|p| {
+                let (kind, manufacturer, product, serial_number, vid, pid) = match p.port_type {
+                    tokio_serial::SerialPortType::UsbPort(info) => (
+                        "usb",
+                        info.manufacturer,
+                        info.product,
+                        info.serial_number,
+                        Some(format!("{:04x}", info.vid)),
+                        Some(format!("{:04x}", info.pid)),
+                    ),
+                    tokio_serial::SerialPortType::PciPort => ("pci", None, None, None, None, None),
+                    tokio_serial::SerialPortType::BluetoothPort => {
+                        ("bluetooth", None, None, None, None, None)
+                    }
+                    tokio_serial::SerialPortType::Unknown => {
+                        ("unknown", None, None, None, None, None)
+                    }
+                };
+                PortInfo {
+                    path: p.port_name,
+                    kind: kind.to_string(),
+                    manufacturer,
+                    product,
+                    serial_number,
+                    vid,
+                    pid,
+                }
+            })
+            .collect::<Vec<_>>(),
+        Err(e) => {
+            tracing::warn!(error=%e, "available_ports failed; returning empty list");
+            Vec::new()
+        }
+    };
+    Ok(serde_json::to_value(ListPortsResult { ports }).unwrap())
+}
+
+/// Apply a partial update to the live serial settings.
+///
+/// All fields are optional; absent fields keep their current value. The
+/// daemon updates the live `tokio_serial::SerialStream` in place when the
+/// backend supports termios (USB serial, real UART). For PTY/pipe-style
+/// devices that don't accept termios, the call returns
+/// `UnsupportedSerialOp` and the device's settings stay unchanged.
+pub async fn set_device(
+    state: &DaemonState,
+    _conn: &ConnState,
+    params: Option<Value>,
+) -> Result<Value, ProtocolError> {
+    let p: SetDeviceParams = parse_params(params)?;
+
+    // Validate every requested change first, so we never half-apply a partial
+    // update because (e.g.) a typo'd parity name slipped through.
+    let baud = p.baud;
+    let data_bits = match p.data_bits {
+        Some(n) => Some(SerialDataBits::from_u8(n).ok_or_else(|| {
+            err_with(
+                ErrorCode::InvalidSerialSetting,
+                format!("data_bits must be 5..=8, got {n}"),
+            )
+        })?),
+        None => None,
+    };
+    let parity = match p.parity.as_deref() {
+        Some(s) => Some(SerialParity::parse(s).ok_or_else(|| {
+            err_with(
+                ErrorCode::InvalidSerialSetting,
+                format!("parity must be none|odd|even, got {s:?}"),
+            )
+        })?),
+        None => None,
+    };
+    let stop_bits = match p.stop_bits {
+        Some(n) => Some(SerialStopBits::from_u8(n).ok_or_else(|| {
+            err_with(
+                ErrorCode::InvalidSerialSetting,
+                format!("stop_bits must be 1 or 2, got {n}"),
+            )
+        })?),
+        None => None,
+    };
+    let flow_control = match p.flow_control.as_deref() {
+        Some(s) => Some(SerialFlow::parse(s).ok_or_else(|| {
+            err_with(
+                ErrorCode::InvalidSerialSetting,
+                format!("flow_control must be none|software|hardware, got {s:?}"),
+            )
+        })?),
+        None => None,
+    };
+
+    if baud.is_none()
+        && data_bits.is_none()
+        && parity.is_none()
+        && stop_bits.is_none()
+        && flow_control.is_none()
+    {
+        return Err(err_with(
+            ErrorCode::InvalidParams,
+            "set_device requires at least one of baud/data_bits/parity/stop_bits/flow_control",
+        ));
+    }
+
+    state
+        .serial_control
+        .apply(baud, data_bits, parity, stop_bits, flow_control)
+        .await
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::Unsupported => {
+                ProtocolError::new(ErrorCode::UnsupportedSerialOp).with_message(e.to_string())
+            }
+            std::io::ErrorKind::NotConnected => {
+                ProtocolError::new(ErrorCode::DeviceDisconnected).with_message(e.to_string())
+            }
+            _ => err_with(ErrorCode::InvalidSerialSetting, e.to_string()),
+        })?;
+
+    let device_connected = state.device_state.lock().connected;
+    let device = device_info_from(&state.config.lock(), device_connected);
+
+    // Notify all attached clients about the live config change so UIs can
+    // refresh without polling. Mirrors the existing connect/disconnect
+    // notifications.
+    let _ = state
+        .device_events
+        .send(crate::state::DeviceEvent {
+            kind: crate::state::DeviceEventKind::ConfigChanged,
+            detail: Some(format!(
+                "config changed: {} {}{}{} flow={}",
+                device.baud,
+                device.data_bits,
+                device
+                    .parity
+                    .chars()
+                    .next()
+                    .map(|c| c.to_ascii_uppercase())
+                    .unwrap_or('?'),
+                device.stop_bits,
+                device.flow_control,
+            )),
+        });
+
+    Ok(serde_json::to_value(SetDeviceResult { device }).unwrap())
 }
 
 // ---------- Internal helpers ----------

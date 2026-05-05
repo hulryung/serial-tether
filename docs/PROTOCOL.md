@@ -231,7 +231,15 @@ The targeted request responds with `-32800 cancelled`. If the request has alread
 ```jsonc
 {"method":"status","params":{}}
 → {"result":{
-     "device":{"path":"/dev/ttyUSB0","baud":115200,"connected":true},
+     "device":{
+       "path":"/dev/ttyUSB0",
+       "baud":115200,
+       "data_bits":8,
+       "parity":"none",
+       "stop_bits":1,
+       "flow_control":"none",
+       "connected":true
+     },
      "buffer":{"head_seq":12345,"tail_seq":3201,"capacity":65536},
      "lock":{"holder_session_id":"01HV...","acquired_at":"2026-04-29T..."},
      "sessions":[
@@ -241,14 +249,55 @@ The targeted request responds with `-32800 cancelled`. If the request has alread
    }}
 ```
 
-### 6.9 `set_device` (administrative)
+`device.parity` is one of `"none" | "odd" | "even"`. `device.flow_control` is one of `"none" | "software" | "hardware"`.
 
-Change baud (etc.) at runtime. Restricted to `kind:"human"` clients.
+### 6.9 `list_ports` (since v0.7)
+
+Enumerate the serial ports the daemon's host machine knows about. Useful for picking a device to connect when you don't know the path. Returns an empty array on platforms or environments where enumeration is unavailable (a warning is logged server-side).
 
 ```jsonc
-{"method":"set_device","params":{"baud":921600}}
-→ {"result":{"device":{...}}}
+{"method":"list_ports","params":{}}
+→ {"result":{"ports":[
+     {
+       "path":"/dev/ttyUSB0",
+       "kind":"usb",                  // "usb" | "pci" | "bluetooth" | "unknown"
+       "manufacturer":"FTDI",
+       "product":"FT232R USB UART",
+       "serial_number":"A50285BI",
+       "vid":"0403",                  // lowercase 4-hex
+       "pid":"6001"
+     },
+     {"path":"/dev/ttyS0","kind":"unknown"}
+   ]}}
 ```
+
+### 6.10 `set_device` (since v0.7)
+
+Apply a partial update to the live serial settings. Every field is optional;
+absent fields keep their current value. The change is applied to the open
+`SerialStream` in place — the device handle is not dropped, in-flight reads/writes are not interrupted.
+
+```jsonc
+{"method":"set_device","params":{
+   "baud":921600,                    // optional
+   "data_bits":8,                    // optional, 5..=8
+   "parity":"none",                  // optional, "none" | "odd" | "even"
+   "stop_bits":1,                    // optional, 1 or 2
+   "flow_control":"none"             // optional, "none" | "software" | "hardware"
+ }}
+→ {"result":{"device":{...}}}        // device shape from §6.8
+```
+
+A successful apply updates the daemon's stored config (so the same settings
+survive an auto-reconnect) and broadcasts a `device` notification with
+`kind:"config_changed"` to every attached client (§7.5).
+
+Errors:
+
+- `-32007 unsupported_serial_op` — the device's backend can't accept termios changes (e.g. PTYs, pipes).
+- `-32008 invalid_serial_setting` — value out of range, unknown parity/flow string, or hardware refused.
+- `-32602 invalid_params` — no fields supplied.
+- `-32005 device_disconnected` — set during a reconnect attempt; the new settings are remembered and applied on the next successful open.
 
 ## 7. Server → client notifications
 
@@ -324,6 +373,8 @@ If the device drops, in-flight `expect`/`run` requests fail with `-32005 device_
 | `-32004` | lock contention (`preempt:fail`) |
 | `-32005` | device disconnected |
 | `-32006` | buffer overflow (`max_bytes` exceeded without a match) |
+| `-32007` | unsupported serial operation (backend can't apply termios) |
+| `-32008` | invalid serial setting (out-of-range / unknown value) |
 | `-32010` | unsupported protocol |
 | `-32011` | not initialized (called before `hello`) |
 | `-32012` | session not found |
