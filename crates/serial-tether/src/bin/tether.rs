@@ -51,6 +51,17 @@ struct Cli {
     #[arg(long, global = true)]
     auto_reconnect: bool,
 
+    /// Standalone mode: also start a private `tetherd` for this device,
+    /// run the requested command (or shell), then shut the daemon down
+    /// when the client exits. Same UX as `tio /dev/ttyUSB0`.
+    /// Cannot be combined with `-s tcp://...` or an explicit `-s` socket.
+    #[arg(short = 'D', long, global = true, value_name = "DEVICE")]
+    device: Option<String>,
+
+    /// Baud rate for standalone mode (only used when `-D` is given).
+    #[arg(short = 'b', long, global = true, default_value_t = 115200)]
+    baud: u32,
+
     /// If no subcommand is given, drops into the interactive shell.
     #[command(subcommand)]
     cmd: Option<Cmd>,
@@ -207,7 +218,21 @@ enum Endpoint<'a> {
     Tcp(&'a str),
 }
 
-async fn run(cli: Cli) -> Result<(), CliError> {
+async fn run(mut cli: Cli) -> Result<(), CliError> {
+    // Standalone mode: spawn our own tetherd, then continue as a normal
+    // client against its ephemeral UDS. The guard kills the child when
+    // we exit, regardless of how (clean exit, error, panic).
+    let _daemon_guard = if let Some(device) = cli.device.clone() {
+        if matches!(endpoint_kind(&cli.socket), Endpoint::Tcp(_)) {
+            return Err(CliError::Connection(
+                "tether: -D and -s tcp://... are mutually exclusive (standalone mode is local UDS only)".into(),
+            ));
+        }
+        Some(spawn_embedded_daemon(&device, cli.baud, &mut cli).await?)
+    } else {
+        None
+    };
+
     match endpoint_kind(&cli.socket) {
         Endpoint::Uds(path) => {
             let stream = UnixStream::connect(path)
@@ -225,6 +250,127 @@ async fn run(cli: Cli) -> Result<(), CliError> {
             run_with_stream(framed, cli).await
         }
     }
+}
+
+/// RAII guard that owns the spawned daemon child. On drop, sends SIGTERM
+/// (best-effort) and removes the temporary socket file.
+struct DaemonGuard {
+    child: Option<std::process::Child>,
+    socket_path: std::path::PathBuf,
+    log_path: Option<std::path::PathBuf>,
+}
+
+impl Drop for DaemonGuard {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            // SIGTERM first; if the daemon ignores it we'd ideally escalate,
+            // but for a one-shot client exit "best effort" is fine.
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let _ = std::fs::remove_file(&self.socket_path);
+        if let Some(p) = &self.log_path {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+}
+
+/// Find the `tetherd` binary, preferring the one next to the running
+/// `tether` so that (`/usr/local/bin/tether`, `/usr/local/bin/tetherd`)
+/// stays in sync.
+fn find_tetherd() -> Result<std::path::PathBuf, CliError> {
+    // 1. Same dir as our own binary.
+    if let Ok(self_exe) = std::env::current_exe() {
+        if let Some(dir) = self_exe.parent() {
+            let candidate = dir.join("tetherd");
+            if candidate.is_file() {
+                return Ok(candidate);
+            }
+        }
+    }
+    // 2. Fall back to PATH.
+    if let Ok(path_var) = std::env::var("PATH") {
+        for dir in path_var.split(':') {
+            let candidate = std::path::Path::new(dir).join("tetherd");
+            if candidate.is_file() {
+                return Ok(candidate);
+            }
+        }
+    }
+    Err(CliError::Connection(
+        "tether: -D needs the `tetherd` binary; install it with the same package as tether"
+            .into(),
+    ))
+}
+
+async fn spawn_embedded_daemon(
+    device: &str,
+    baud: u32,
+    cli: &mut Cli,
+) -> Result<DaemonGuard, CliError> {
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    let tetherd = find_tetherd()?;
+    let pid = std::process::id();
+    let nonce: u32 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let sock_path = std::path::PathBuf::from(format!("/tmp/tether-{pid}-{nonce}.sock"));
+    let log_path = std::path::PathBuf::from(format!("/tmp/tether-{pid}-{nonce}.log"));
+
+    let log_file = std::fs::File::create(&log_path).map_err(|e| {
+        CliError::Connection(format!("tether: cannot create daemon log {log_path:?}: {e}"))
+    })?;
+    let log_for_err = log_file.try_clone().map_err(|e| {
+        CliError::Connection(format!("tether: dup log fd: {e}"))
+    })?;
+
+    let child = Command::new(&tetherd)
+        .arg("-D").arg(device)
+        .arg("-b").arg(baud.to_string())
+        .arg("-s").arg(&sock_path)
+        .stdout(Stdio::from(log_file))
+        .stderr(Stdio::from(log_for_err))
+        .spawn()
+        .map_err(|e| {
+            let _ = std::fs::remove_file(&log_path);
+            CliError::Connection(format!(
+                "tether: failed to spawn {tetherd:?}: {e}"
+            ))
+        })?;
+
+    let mut guard = DaemonGuard {
+        child: Some(child),
+        socket_path: sock_path.clone(),
+        log_path: Some(log_path.clone()),
+    };
+
+    // Wait up to 5s for the daemon to bind its socket. If the child dies
+    // before then, surface the captured banner/log so the user can see why.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if sock_path.exists() {
+            // Override the socket the rest of the client logic will dial.
+            cli.socket = sock_path.to_string_lossy().into_owned();
+            return Ok(guard);
+        }
+        // Did the child exit early?
+        if let Some(child) = guard.child.as_mut() {
+            if let Ok(Some(status)) = child.try_wait() {
+                let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+                guard.child = None; // already reaped
+                return Err(CliError::Connection(format!(
+                    "tether: embedded tetherd exited (status {status}) before binding socket\n\n{log}"
+                )));
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    Err(CliError::Connection(format!(
+        "tether: embedded tetherd did not bind {sock_path:?} within 5s"
+    )))
 }
 
 /// Build a friendly multi-line error when the local Unix socket can't be

@@ -108,13 +108,17 @@ cargo build --workspace --release
 ## Quick start
 
 ```sh
-# Terminal 1 — daemon owns the port (default: UDS at /tmp/tetherd.sock)
+# Standalone — `tether` brings up its own private daemon for one device,
+# then shuts it down when you exit. Same UX as `tio /dev/ttyUSB0`:
+tether -D /dev/tty.usbserial-XXXX -b 115200      # Ctrl-A then Q to quit
+
+# Multi-client — start a long-lived daemon, attach as many clients as you
+# want from any terminal (or remote, with --tcp).
+# Terminal 1:
 tetherd -D /dev/tty.usbserial-XXXX -b 115200
-
-# Terminal 2 — drop into a tio-style interactive shell
-tether                                  # Ctrl-A then Q to quit
-
-# Or, for agents / scripts:
+# Terminal 2 — interactive shell:
+tether
+# Terminal 3 — agent / scripted:
 tether status
 tether run "version" -u "# " --literal --timeout-ms 3000 --json
 tether tail
