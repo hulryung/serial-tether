@@ -68,7 +68,7 @@ ORANGE  = "\x1b[38;5;208m"
 PURPLE  = "\x1b[35m"
 
 PROMPT  = f"{BOLD}{GREEN}$ {RESET}"
-DEV     = f"{ORANGE}ASAD SOC => {RESET}"
+DEV     = f"{ORANGE}uboot > {RESET}"
 
 # ---------------------------------------------------------------------------
 # Scenes
@@ -161,7 +161,7 @@ def main():
     c.out(f"{DIM}# For an agent or shell script — transactional, JSON, race-free{RESET}\n")
     c.pause(0.4)
     c.out(PROMPT)
-    c.type('tether --json run "version" --newline crlf -u "ASAD SOC => " --literal', base=0.04)
+    c.type('tether --json run "version" --newline crlf -u "uboot > " --literal', base=0.04)
     c.pause(0.3)
     c.out("\n", 0.15)
     c.pause(0.7)
@@ -171,7 +171,7 @@ def main():
         '  "before": "",',
         '  "duration_ms": 15,',
         '  "end_seq": 4726,',
-        '  "match": "ASAD SOC => ",',
+        '  "match": "uboot > ",',
         '  "match_seq": 4714,',
         '  "matched": true,',
         '  "output": "U-Boot 2025.01-g7c589e7dc280-dirty (Apr 18 2026 - 21:32:03 +0900)\\r\\n\\r\\n",',
