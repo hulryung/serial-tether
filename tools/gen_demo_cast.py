@@ -30,6 +30,11 @@ class Cast:
         }
 
     def out(self, s, delay=0.0):
+        # Asciinema replays bytes against a raw-mode terminal — bare LF only
+        # moves down without returning to column 0 ("staircase" effect).
+        # Normalise any CRLF/LF mix in the output string to consistent CRLF
+        # so callers don't have to think about it.
+        s = s.replace("\r\n", "\n").replace("\n", "\r\n")
         self.t += delay
         self.events.append([round(self.t, 3), "o", s])
 
