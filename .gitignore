@@ -4,3 +4,4 @@ Cargo.lock.bak
 .DS_Store
 /tmp/
 *.sock
+tools/__pycache__/

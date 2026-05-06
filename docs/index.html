@@ -274,8 +274,36 @@
 
 <section id="demo" class="wrap">
   <h2>Demo</h2>
-  <p class="muted">~30 seconds. Daemon banner, an interactive shell session, an agent-style JSON run, and a tail.</p>
-  <div id="demo-player" style="margin-top: 16px;"></div>
+  <p class="muted">
+    Two humans in their own <code>tether</code> shells, attached to the same daemon
+    on a single serial port. Every byte the device emits is broadcast to every
+    session — <code>screen -x</code> for a U-Boot prompt.
+  </p>
+  <div id="dual-shell-player" style="margin-top: 16px;"></div>
+
+  <details class="demo-extra" style="margin-top: 24px;">
+    <summary>More flavors — same idea, different right-pane</summary>
+
+    <div style="margin-top: 16px;">
+      <h3 style="margin-bottom: 4px;">CLI + shell</h3>
+      <p class="muted">
+        Human in a <code>tether</code> shell on the left; on the right, a scripter
+        running one-shot <code>tether run</code> / <code>ports</code> / <code>config</code>
+        from another terminal. The scripter's commands echo live into the human's pane.
+      </p>
+      <div id="cli-player" data-cast="cli_demo.cast" style="margin-top: 8px;"></div>
+    </div>
+
+    <div style="margin-top: 24px;">
+      <h3 style="margin-bottom: 4px;">Agent + shell</h3>
+      <p class="muted">
+        Same setup, but the right pane is an LLM/agent calling
+        <code>tether --json run</code> for transactional RPCs, plus a live
+        <code>tether config --baud</code> toward the end.
+      </p>
+      <div id="agent-player" data-cast="split_demo.cast" style="margin-top: 8px;"></div>
+    </div>
+  </details>
 </section>
 
 <section id="install" class="wrap">
@@ -422,17 +450,47 @@ TETHER_AUTH_TOKEN=&lt;token-from-banner&gt; \
 
 <script src="https://cdn.jsdelivr.net/npm/asciinema-player@3.7.1/dist/bundle/asciinema-player.min.js"></script>
 <script>
-  AsciinemaPlayer.create('demo.cast', document.getElementById('demo-player'), {
-    autoPlay: true,
-    loop: true,
-    speed: 1.0,
-    idleTimeLimit: 1.0,
-    theme: 'asciinema',
-    cols: 100,
-    rows: 30,
-    fit: 'width',
-    poster: 'npt:0:00',
-  });
+  // Main demo: dual interactive shells. Autoplay + loop.
+  AsciinemaPlayer.create(
+    'dual_shell_demo.cast',
+    document.getElementById('dual-shell-player'),
+    {
+      autoPlay: true,
+      loop: true,
+      speed: 1.0,
+      idleTimeLimit: 1.0,
+      theme: 'asciinema',
+      cols: 120,
+      rows: 32,
+      fit: 'width',
+      poster: 'npt:0:00',
+    }
+  );
+
+  // Lazy-init the players inside the <details> block — asciinema-player needs
+  // a non-zero container width when it mounts, so we wait until the user
+  // expands the section before instantiating each one.
+  const lazyDetails = document.querySelector('details.demo-extra');
+  if (lazyDetails) {
+    let mounted = false;
+    lazyDetails.addEventListener('toggle', () => {
+      if (mounted || !lazyDetails.open) return;
+      mounted = true;
+      document.querySelectorAll('details.demo-extra div[data-cast]').forEach((el) => {
+        AsciinemaPlayer.create(el.dataset.cast, el, {
+          autoPlay: false,
+          loop: true,
+          speed: 1.0,
+          idleTimeLimit: 1.0,
+          theme: 'asciinema',
+          cols: 120,
+          rows: 32,
+          fit: 'width',
+          poster: 'npt:0:00',
+        });
+      });
+    });
+  }
 </script>
 
 </body>

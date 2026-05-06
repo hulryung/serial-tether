@@ -8,7 +8,8 @@
 
 **Docs**:
 - [`docs/OVERVIEW.md`](docs/OVERVIEW.md) — what it is, why, and how it works (read this first)
-- [`docs/AGENT_USAGE.md`](docs/AGENT_USAGE.md) — one-page command cookbook for AI agents
+- [`docs/AI_AGENT_GUIDE.md`](docs/AI_AGENT_GUIDE.md) — **how to teach Claude Code / Codex / Cursor to use it** (paste-and-go AGENTS.md block + verification script)
+- [`docs/AGENT_USAGE.md`](docs/AGENT_USAGE.md) — one-page command cookbook the AI agent itself reads
 - [`docs/PROTOCOL.md`](docs/PROTOCOL.md) — JSON-RPC 2.0 / NDJSON wire spec (v1)
 - [`examples/`](examples/) — five working Bash automation scripts
 
@@ -58,12 +59,32 @@ away from the engineers who have always lived inside it.**
 
 ## Demo
 
-![Serial Tether demo — daemon banner, interactive shell, agent run, tail](assets/demo.gif)
+![Two interactive `tether` shells sharing one serial console](assets/dual_shell_demo.gif)
 
-Daemon banner, a tio-style interactive shell on a U-Boot board, an agent's
-JSON `run`, and a `tail` — all 30 seconds. Same daemon, same port, same time.
+Two humans, one serial console — every byte the device emits is broadcast
+to every attached session. Think `screen -x` for a U-Boot prompt.
 
-> Higher-fidelity (asciinema-player, click to seek):
+<details>
+<summary><b>More flavors</b> — same idea, different right-pane (click to expand)</summary>
+
+### CLI + shell
+
+Human in a `tether` shell on the left; on the right, a scripter
+running one-shot `tether run` / `ports` / `config` from another terminal.
+The scripter's commands echo live into the human's pane.
+
+![cli + shell](assets/cli_demo.gif)
+
+### Agent + shell
+
+Same setup, but the right pane is an LLM/agent calling `tether --json run`
+for transactional RPCs (with a live `tether config --baud` toward the end).
+
+![agent + shell](assets/split_demo.gif)
+
+</details>
+
+> Higher-fidelity (asciinema-player, click to seek between the three):
 > <https://hulryung.github.io/serial-tether/#demo>
 
 ## Components
@@ -157,6 +178,13 @@ tether --json run "$cmd" -u "$prompt" --literal --timeout-ms 5000
 ```
 
 Agent-friendly defaults are baked in: `--strip-ansi`, `--strip-echo`, `--max-output-bytes 8192`. The `--json` payload includes a decoded `output` field so an LLM never has to deal with base64.
+
+### Pointing an AI agent at your board
+
+If you want **Claude Code / Codex / Cursor** to drive the console, see
+[`docs/AI_AGENT_GUIDE.md`](docs/AI_AGENT_GUIDE.md) — a paste-and-go
+`AGENTS.md` / `CLAUDE.md` block plus a four-step verification script you
+can ask the agent to run before handing it the actual task.
 
 ## Protocol
 
