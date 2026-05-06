@@ -59,22 +59,13 @@ away from the engineers who have always lived inside it.**
 
 ## Demo
 
-![One daemon, two boards — `tetherd -D board0=... -D board1=...`](assets/multi_device_demo.gif)
-
-One `tetherd` process owns N serial ports. Clients address each by an
-operator-chosen id (`tether -d board0`, `tether -d board1`). Per-device
-baud / parity / etc. inline in `-D`. Buffer + lock + writer state are
-all per-device — traffic streams stay isolated.
-
-<details>
-<summary><b>More flavors</b> — same idea, different angle (click to expand)</summary>
-
-### Two interactive shells, one console
+![Two interactive `tether` shells sharing one serial console](assets/dual_shell_demo.gif)
 
 Two humans, one serial console — every byte the device emits is broadcast
 to every attached session. Think `screen -x` for a U-Boot prompt.
 
-![two shells, one console](assets/dual_shell_demo.gif)
+<details>
+<summary><b>More flavors</b> — same idea, different right-pane (click to expand)</summary>
 
 ### CLI + shell
 
@@ -93,7 +84,19 @@ for transactional RPCs (with a live `tether config --baud` toward the end).
 
 </details>
 
-> Higher-fidelity (asciinema-player, click to seek between the four):
+<details>
+<summary><b>Multiple boards on one daemon</b> (v0.8) — different concept, click to expand</summary>
+
+One `tetherd` owns N serial ports. Clients address each by an
+operator-chosen id (`tether -d board0`, `tether -d board1`). Per-device
+baud / parity / etc. inline in `-D`. Buffers, locks, and event broadcast
+are all per-device — traffic streams stay isolated.
+
+![one daemon, two boards](assets/multi_device_demo.gif)
+
+</details>
+
+> Higher-fidelity (asciinema-player, click to seek between all four):
 > <https://hulryung.github.io/serial-tether/#demo>
 
 ## Components

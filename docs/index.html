@@ -275,27 +275,16 @@
 <section id="demo" class="wrap">
   <h2>Demo</h2>
   <p class="muted">
-    One <code>tetherd</code> process owns N serial ports. Clients address each by
-    an operator-chosen id (<code>tether -d board0</code>, <code>tether -d board1</code>),
-    with per-device baud / parity / etc. inline in <code>-D</code>. Each device
-    has its own ring buffer, writer lock, and event broadcast — traffic stays isolated.
+    Two humans in their own <code>tether</code> shells, attached to the same daemon
+    on a single serial port. Every byte the device emits is broadcast to every
+    session — <code>screen -x</code> for a U-Boot prompt.
   </p>
-  <div id="multi-device-player" style="margin-top: 16px;"></div>
+  <div id="dual-shell-player" style="margin-top: 16px;"></div>
 
   <details class="demo-extra" style="margin-top: 24px;">
-    <summary>More flavors — same idea, different angle</summary>
+    <summary>More flavors — same idea, different right-pane</summary>
 
     <div style="margin-top: 16px;">
-      <h3 style="margin-bottom: 4px;">Two interactive shells, one console</h3>
-      <p class="muted">
-        Two humans in their own <code>tether</code> shells, attached to the same
-        daemon on a single port. Every byte the device emits is broadcast to every
-        session — <code>screen -x</code> for a U-Boot prompt.
-      </p>
-      <div id="dual-shell-player" data-cast="dual_shell_demo.cast" style="margin-top: 8px;"></div>
-    </div>
-
-    <div style="margin-top: 24px;">
       <h3 style="margin-bottom: 4px;">CLI + shell</h3>
       <p class="muted">
         Human in a <code>tether</code> shell on the left; on the right, a scripter
@@ -313,6 +302,20 @@
         <code>tether config --baud</code> toward the end.
       </p>
       <div id="agent-player" data-cast="split_demo.cast" style="margin-top: 8px;"></div>
+    </div>
+  </details>
+
+  <details class="demo-extra" style="margin-top: 24px;">
+    <summary>Multiple boards on one daemon (v0.8) — different concept</summary>
+
+    <div style="margin-top: 16px;">
+      <p class="muted">
+        One <code>tetherd</code> process owns N serial ports. Clients address each by
+        an operator-chosen id (<code>tether -d board0</code>, <code>tether -d board1</code>),
+        with per-device baud / parity / etc. inline in <code>-D</code>. Each device
+        has its own ring buffer, writer lock, and event broadcast — traffic stays isolated.
+      </p>
+      <div id="multi-device-player" data-cast="multi_device_demo.cast" style="margin-top: 8px;"></div>
     </div>
   </details>
 </section>
@@ -461,10 +464,10 @@ TETHER_AUTH_TOKEN=&lt;token-from-banner&gt; \
 
 <script src="https://cdn.jsdelivr.net/npm/asciinema-player@3.7.1/dist/bundle/asciinema-player.min.js"></script>
 <script>
-  // Main demo: one daemon, two boards. Autoplay + loop.
+  // Main demo: dual interactive shells. Autoplay + loop.
   AsciinemaPlayer.create(
-    'multi_device_demo.cast',
-    document.getElementById('multi-device-player'),
+    'dual_shell_demo.cast',
+    document.getElementById('dual-shell-player'),
     {
       autoPlay: true,
       loop: true,
@@ -478,16 +481,15 @@ TETHER_AUTH_TOKEN=&lt;token-from-banner&gt; \
     }
   );
 
-  // Lazy-init the players inside the <details> block — asciinema-player needs
-  // a non-zero container width when it mounts, so we wait until the user
-  // expands the section before instantiating each one.
-  const lazyDetails = document.querySelector('details.demo-extra');
-  if (lazyDetails) {
+  // Lazy-init the players inside each <details> block — asciinema-player
+  // needs a non-zero container width when it mounts, so we wait until the
+  // user expands a section before instantiating its players.
+  document.querySelectorAll('details.demo-extra').forEach((det) => {
     let mounted = false;
-    lazyDetails.addEventListener('toggle', () => {
-      if (mounted || !lazyDetails.open) return;
+    det.addEventListener('toggle', () => {
+      if (mounted || !det.open) return;
       mounted = true;
-      document.querySelectorAll('details.demo-extra div[data-cast]').forEach((el) => {
+      det.querySelectorAll('div[data-cast]').forEach((el) => {
         AsciinemaPlayer.create(el.dataset.cast, el, {
           autoPlay: false,
           loop: true,
@@ -501,7 +503,7 @@ TETHER_AUTH_TOKEN=&lt;token-from-banner&gt; \
         });
       });
     });
-  }
+  });
 </script>
 
 </body>
