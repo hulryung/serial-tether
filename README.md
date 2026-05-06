@@ -115,7 +115,7 @@ cargo install serial-tether
 
 **Pre-built binaries via curl** (no dependencies):
 ```sh
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/hulryung/serial-tether/releases/download/v0.6.0/serial-tether-installer.sh | sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/hulryung/serial-tether/releases/download/v0.7.1/serial-tether-installer.sh | sh
 ```
 
 Or **build from source**:
@@ -169,6 +169,28 @@ UDS connections are authenticated by the OS (file permissions); TCP
 connections always require a token. Run with both `-s /tmp/tetherd.sock` and
 `--tcp ...` to expose the daemon on both transports simultaneously.
 
+### More than one board
+
+A daemon owns one serial port. With multiple USB serial devices, run one
+daemon per port and tag each with `--name`:
+
+```sh
+# Terminal 1: daemon for board 0
+tetherd -D /dev/tty.usbserial-A --name board0
+
+# Terminal 2: daemon for board 1
+tetherd -D /dev/tty.usbserial-B --name board1
+
+# Then talk to whichever you want — `--name` on the client expands to
+# /tmp/tetherd-<NAME>.sock, no need to remember sockets.
+tether --name board0 status
+tether --name board1 run "version" -u "# " --literal --timeout-ms 3000 --json
+```
+
+`--name` is just a convenience for the default UDS path. The plain
+`tetherd` (no `--name`) and `tether` (no flags) still use
+`/tmp/tetherd.sock` exactly like before — single-board setups don't change.
+
 ## The one command an agent should reach for
 
 ```sh
@@ -200,7 +222,12 @@ bash tools/smoke_test.sh
 
 ## Status
 
-Shipped through v0.6.0:
+Shipped through v0.7.1:
+- ✅ `list_ports` / `set_device` / live `tether config --baud` etc. (v0.7.0)
+- ✅ Shell escapes Ctrl-A C (config) / V (ports) (v0.7.0)
+- ✅ `--name <NAME>` for running multiple daemons side-by-side (v0.7.1)
+
+Through v0.6.0:
 - ✅ `hello` / `attach` / `detach` / `send` / `expect` / `run` / `status`
 - ✅ writer lock with `preempt` policy (queue / fail / force)
 - ✅ `strip_ansi` / `strip_echo` / `max_output_bytes` (with truncation marker)

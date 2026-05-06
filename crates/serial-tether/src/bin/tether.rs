@@ -34,8 +34,18 @@ use tether_protocol::{
 struct Cli {
     /// Daemon endpoint. Either a UDS path (e.g. /tmp/tetherd.sock) or
     /// `tcp://host:port` / `tcp:host:port` for a remote daemon.
-    #[arg(short = 's', long, default_value = "/tmp/tetherd.sock", global = true)]
-    socket: String,
+    ///
+    /// Default: `/tmp/tetherd.sock`, or `/tmp/tetherd-<NAME>.sock` if
+    /// `--name` is set.
+    #[arg(short = 's', long, global = true, conflicts_with = "name")]
+    socket: Option<String>,
+
+    /// Connect to the named daemon at `/tmp/tetherd-<NAME>.sock`.
+    ///
+    /// Convenience alias when `tetherd` was started with the same `--name`.
+    /// Mutually exclusive with `--socket` (use `-s tcp://...` for TCP).
+    #[arg(long, global = true, value_name = "NAME")]
+    name: Option<String>,
 
     /// Emit raw JSON output instead of human-readable form.
     #[arg(long, global = true)]
@@ -249,11 +259,21 @@ enum Endpoint<'a> {
 }
 
 async fn run(mut cli: Cli) -> Result<(), CliError> {
+    // Resolve --socket vs --name vs default into a single canonical endpoint
+    // string, then keep using cli.socket as the source of truth (so
+    // standalone mode can still rewrite it after spawning the daemon).
+    let resolved = match (&cli.socket, &cli.name) {
+        (Some(s), _) => s.clone(),
+        (None, Some(n)) => format!("/tmp/tetherd-{n}.sock"),
+        (None, None) => "/tmp/tetherd.sock".to_string(),
+    };
+    cli.socket = Some(resolved);
+
     // Standalone mode: spawn our own tetherd, then continue as a normal
     // client against its ephemeral UDS. The guard kills the child when
     // we exit, regardless of how (clean exit, error, panic).
     let _daemon_guard = if let Some(device) = cli.device.clone() {
-        if matches!(endpoint_kind(&cli.socket), Endpoint::Tcp(_)) {
+        if matches!(endpoint_kind(cli.socket.as_deref().unwrap()), Endpoint::Tcp(_)) {
             return Err(CliError::Connection(
                 "tether: -D and -s tcp://... are mutually exclusive (standalone mode is local UDS only)".into(),
             ));
@@ -263,7 +283,7 @@ async fn run(mut cli: Cli) -> Result<(), CliError> {
         None
     };
 
-    match endpoint_kind(&cli.socket) {
+    match endpoint_kind(cli.socket.as_deref().unwrap()) {
         Endpoint::Uds(path) => {
             let stream = UnixStream::connect(path)
                 .await
@@ -383,7 +403,7 @@ async fn spawn_embedded_daemon(
     while Instant::now() < deadline {
         if sock_path.exists() {
             // Override the socket the rest of the client logic will dial.
-            cli.socket = sock_path.to_string_lossy().into_owned();
+            cli.socket = Some(sock_path.to_string_lossy().into_owned());
             return Ok(guard);
         }
         // Did the child exit early?

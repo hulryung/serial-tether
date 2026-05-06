@@ -158,6 +158,27 @@ esac
 This is a starting heuristic, not gospel. Verify with `version`, `uname`, or
 whatever the board accepts.
 
+## Multiple boards on one host
+
+A daemon owns one port. If the host has several USB serial devices, the
+operator runs one daemon per port and tags them with `--name`:
+
+```sh
+tetherd -D /dev/ttyUSB0 --name board0 &
+tetherd -D /dev/ttyUSB1 --name board1 &
+```
+
+You then pass `--name` on every command instead of `-s`:
+
+```sh
+tether --name board0 status
+tether --name board0 run "version" -u "# " --literal --newline crlf --timeout-ms 3000 --json
+tether --name board1 sync
+```
+
+`--name X` is shorthand for `-s /tmp/tetherd-X.sock`. Don't mix the two
+on the same call — clap will reject it.
+
 ## Remote daemons (over a network)
 
 Native TCP transport with token auth (v0.4.0+; v0.5 lets you say just `--tcp`):

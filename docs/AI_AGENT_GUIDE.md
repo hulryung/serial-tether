@@ -102,6 +102,8 @@ path, TCP, multiple boards), add a one-line note alongside:
 
 ```markdown
 - Daemon socket: `tcp://lab-host.local:5557`, token in `${TETHER_AUTH_TOKEN}`.
+- Or, multiple local boards: pass `--name board0` / `--name board1` to every
+  `tether` call. (Operator started each daemon with the matching `--name`.)
 ```
 
 That single section is enough — the agent will follow the link to

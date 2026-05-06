@@ -6,7 +6,7 @@ mod session;
 mod state;
 
 use std::net::{IpAddr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -48,9 +48,21 @@ struct Args {
     #[arg(long, default_value = "none")]
     flow_control: String,
 
-    /// Unix socket path. Use --no-uds to disable.
-    #[arg(short = 's', long, default_value = "/tmp/tetherd.sock")]
-    socket: PathBuf,
+    /// Unix socket path.
+    ///
+    /// Default: `/tmp/tetherd.sock`, or `/tmp/tetherd-<NAME>.sock` if `--name`
+    /// is set. Use `--no-uds` to disable the UDS listener entirely (TCP only).
+    #[arg(short = 's', long)]
+    socket: Option<PathBuf>,
+
+    /// Friendly name for this daemon instance.
+    ///
+    /// Defaults the UDS socket to `/tmp/tetherd-<NAME>.sock`, so multiple
+    /// daemons (one per board) can run side-by-side without colliding.
+    /// Clients reach this daemon with `tether --name <NAME> ...`. Ignored
+    /// when `--socket` is given explicitly.
+    #[arg(long, value_name = "NAME")]
+    name: Option<String>,
 
     /// Disable the Unix socket listener (TCP only).
     #[arg(long)]
@@ -84,9 +96,29 @@ fn random_token() -> String {
     u.simple().to_string()
 }
 
+/// Resolve the effective UDS socket path, given the (optional) explicit
+/// `--socket` and (optional) `--name`. The two are layered:
+///   1. `--socket PATH` always wins (most specific).
+///   2. `--name NAME` → `/tmp/tetherd-<NAME>.sock` (multi-daemon convention).
+///   3. Neither → `/tmp/tetherd.sock` (the historical default).
+fn resolve_socket(socket: Option<&PathBuf>, name: Option<&str>) -> PathBuf {
+    if let Some(p) = socket {
+        return p.clone();
+    }
+    if let Some(n) = name {
+        return PathBuf::from(format!("/tmp/tetherd-{n}.sock"));
+    }
+    PathBuf::from("/tmp/tetherd.sock")
+}
+
 /// Print a human-friendly startup banner to stderr summarising what the
 /// daemon is listening on and how to reach it.
-fn print_banner(args: &Args, tcp_addr: Option<SocketAddr>, auth_token: Option<&str>) {
+fn print_banner(
+    args: &Args,
+    socket_path: &Path,
+    tcp_addr: Option<SocketAddr>,
+    auth_token: Option<&str>,
+) {
     eprintln!();
     eprintln!("Serial Tether {}", env!("CARGO_PKG_VERSION"));
     eprintln!("  device     {} @ {} baud", args.device, args.baud);
@@ -110,7 +142,11 @@ fn print_banner(args: &Args, tcp_addr: Option<SocketAddr>, auth_token: Option<&s
     eprintln!();
     eprintln!("Listening:");
     if !args.no_uds {
-        eprintln!("  unix       {}", args.socket.display());
+        if let Some(n) = &args.name {
+            eprintln!("  unix       {}    (name: {n})", socket_path.display());
+        } else {
+            eprintln!("  unix       {}", socket_path.display());
+        }
     }
     if let Some(bind) = tcp_addr {
         eprintln!("  tcp        {bind}    (auth required)");
@@ -134,7 +170,10 @@ fn print_banner(args: &Args, tcp_addr: Option<SocketAddr>, auth_token: Option<&s
             auth_token.unwrap_or("..."),
             tcp_addr.unwrap().port()
         ),
-        None => "tether".to_string(),
+        None => match &args.name {
+            Some(n) => format!("tether --name {n}"),
+            None => "tether".to_string(),
+        },
     };
     eprintln!("  try:       {example_target} status");
     eprintln!();
@@ -199,6 +238,8 @@ async fn main() -> Result<()> {
     if args.no_uds && args.tcp.is_none() {
         anyhow::bail!("--no-uds requires --tcp; otherwise the daemon has no listener");
     }
+
+    let socket_path = resolve_socket(args.socket.as_ref(), args.name.as_deref());
 
     let data_bits = SerialDataBits::from_u8(args.data_bits)
         .ok_or_else(|| anyhow::anyhow!("invalid --data-bits {}", args.data_bits))?;
@@ -279,13 +320,13 @@ async fn main() -> Result<()> {
 
     // UDS listener.
     if !args.no_uds {
-        if args.socket.exists() {
-            std::fs::remove_file(&args.socket)
-                .with_context(|| format!("remove existing socket {:?}", args.socket))?;
+        if socket_path.exists() {
+            std::fs::remove_file(&socket_path)
+                .with_context(|| format!("remove existing socket {:?}", socket_path))?;
         }
-        let listener = UnixListener::bind(&args.socket)
-            .with_context(|| format!("bind {:?}", args.socket))?;
-        tracing::debug!(socket=?args.socket, "UDS listener bound");
+        let listener = UnixListener::bind(&socket_path)
+            .with_context(|| format!("bind {:?}", socket_path))?;
+        tracing::debug!(socket=?socket_path, "UDS listener bound");
         let state_uds = state.clone();
         listener_tasks.push(tokio::spawn(async move {
             loop {
@@ -343,7 +384,7 @@ async fn main() -> Result<()> {
     }
 
     // Human-friendly summary to stderr.
-    print_banner(&args, tcp_bound, auth_token.as_deref().map(String::as_str));
+    print_banner(&args, &socket_path, tcp_bound, auth_token.as_deref().map(String::as_str));
 
     // Wait for any listener task to exit (which means accept failed).
     for h in listener_tasks {
