@@ -36,7 +36,7 @@ def main() -> None:
     c = Cast(width=120, height=32, title="Serial Tether — multi-client (CLI + shell)")
 
     title = (
-        f"{BOLD}{WHITE}Serial Tether v0.7.0{RESET}"
+        f"{BOLD}{WHITE}Serial Tether v0.8.0{RESET}"
         f"{DIM} — one daemon, two clients on /dev/ttys001{RESET}"
     )
     label_h = f"{BOLD}{GREEN}HUMAN{RESET}{DIM} — interactive shell{RESET}"

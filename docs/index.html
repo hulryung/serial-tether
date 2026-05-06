@@ -275,16 +275,27 @@
 <section id="demo" class="wrap">
   <h2>Demo</h2>
   <p class="muted">
-    Two humans in their own <code>tether</code> shells, attached to the same daemon
-    on a single serial port. Every byte the device emits is broadcast to every
-    session — <code>screen -x</code> for a U-Boot prompt.
+    One <code>tetherd</code> process owns N serial ports. Clients address each by
+    an operator-chosen id (<code>tether -d board0</code>, <code>tether -d board1</code>),
+    with per-device baud / parity / etc. inline in <code>-D</code>. Each device
+    has its own ring buffer, writer lock, and event broadcast — traffic stays isolated.
   </p>
-  <div id="dual-shell-player" style="margin-top: 16px;"></div>
+  <div id="multi-device-player" style="margin-top: 16px;"></div>
 
   <details class="demo-extra" style="margin-top: 24px;">
-    <summary>More flavors — same idea, different right-pane</summary>
+    <summary>More flavors — same idea, different angle</summary>
 
     <div style="margin-top: 16px;">
+      <h3 style="margin-bottom: 4px;">Two interactive shells, one console</h3>
+      <p class="muted">
+        Two humans in their own <code>tether</code> shells, attached to the same
+        daemon on a single port. Every byte the device emits is broadcast to every
+        session — <code>screen -x</code> for a U-Boot prompt.
+      </p>
+      <div id="dual-shell-player" data-cast="dual_shell_demo.cast" style="margin-top: 8px;"></div>
+    </div>
+
+    <div style="margin-top: 24px;">
       <h3 style="margin-bottom: 4px;">CLI + shell</h3>
       <p class="muted">
         Human in a <code>tether</code> shell on the left; on the right, a scripter
@@ -450,10 +461,10 @@ TETHER_AUTH_TOKEN=&lt;token-from-banner&gt; \
 
 <script src="https://cdn.jsdelivr.net/npm/asciinema-player@3.7.1/dist/bundle/asciinema-player.min.js"></script>
 <script>
-  // Main demo: dual interactive shells. Autoplay + loop.
+  // Main demo: one daemon, two boards. Autoplay + loop.
   AsciinemaPlayer.create(
-    'dual_shell_demo.cast',
-    document.getElementById('dual-shell-player'),
+    'multi_device_demo.cast',
+    document.getElementById('multi-device-player'),
     {
       autoPlay: true,
       loop: true,

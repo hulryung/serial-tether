@@ -48,7 +48,7 @@ def main() -> None:
     c = Cast(width=120, height=32, title="Serial Tether — two interactive shells")
 
     title = (
-        f"{BOLD}{WHITE}Serial Tether v0.7.0{RESET}"
+        f"{BOLD}{WHITE}Serial Tether v0.8.0{RESET}"
         f"{DIM} — two humans, one serial console (`screen -x`-style){RESET}"
     )
     label_a = f"{BOLD}{GREEN}USER A{RESET}{DIM} — interactive shell{RESET}"
