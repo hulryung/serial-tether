@@ -271,7 +271,34 @@ Enumerate the serial ports the daemon's host machine knows about. Useful for pic
    ]}}
 ```
 
-### 6.10 `set_device` (since v0.7)
+### 6.10 `list_devices` (since v0.8)
+
+Enumerate the devices currently managed by the daemon. Daemon-wide RPC
+(no `device_id`). Used by clients to discover ids before issuing
+device-targeted RPCs.
+
+```jsonc
+{"method":"list_devices","params":{}}
+→ {"result":{
+     "devices":[
+       {
+         "id":"board0", "path":"/dev/ttyUSB0",
+         "baud":115200, "data_bits":8, "parity":"none",
+         "stop_bits":1, "flow_control":"none",
+         "connected":true, "explicitly_disconnected":false
+       },
+       {"id":"board1", "path":"/dev/ttyUSB1", "baud":9600, ...}
+     ],
+     "default_device":"board0"
+   }}
+```
+
+`default_device` is the id selected when a client omits `device_id`.
+Multi-device daemons return `AmbiguousDevice` for any device-targeted
+RPC that doesn't pass `device_id`; single-device daemons silently fall
+through to the only device for backwards compat.
+
+### 6.11 `set_device` (since v0.7)
 
 Apply a partial update to the live serial settings. Every field is optional;
 absent fields keep their current value. The change is applied to the open
@@ -299,7 +326,52 @@ Errors:
 - `-32602 invalid_params` — no fields supplied.
 - `-32005 device_disconnected` — set during a reconnect attempt; the new settings are remembered and applied on the next successful open.
 
+### 6.12 `send_break` / `set_dtr` / `set_rts` / `read_modem_status` (since v0.8)
+
+Tio-style line / break / modem control. All four take an optional
+`device_id`. Hardware-only — the Fd backend (PTYs, pipes) returns
+`-32007 unsupported_serial_op`.
+
+```jsonc
+{"method":"send_break","params":{"duration_ms":250}}
+→ {"result":{"ok":true}}
+
+{"method":"set_dtr","params":{"on":true}}
+→ {"result":{"ok":true}}
+
+{"method":"set_rts","params":{"on":false}}
+→ {"result":{"ok":true}}
+
+{"method":"read_modem_status","params":{}}
+→ {"result":{"cts":true, "dsr":false, "ri":false, "dcd":true}}
+```
+
+### 6.13 `disconnect_device` / `connect_device` (since v0.8)
+
+Operator-driven port management. `disconnect_device` closes the open
+port and pauses the auto-reconnect loop. The device remains parked in
+`explicitly_disconnected:true` state; pending writes get
+`-32005 device_disconnected`. `connect_device` clears the flag and
+forces an immediate reopen.
+
+```jsonc
+{"method":"disconnect_device","params":{"device_id":"board0"}}
+→ {"result":{"device":{...,"connected":false}}}
+
+{"method":"connect_device","params":{"device_id":"board0"}}
+→ {"result":{"device":{...,"connected":true}, "connected":true}}
+```
+
+`connect_device` waits up to 2s for the reopen to complete; the
+`connected` field reflects the final state.
+
 ## 7. Server → client notifications
+
+> All notifications gained an optional `device_id` field in v0.8 so
+> multi-device daemons can route them. Old single-device clients keep
+> working — they ignore unknown fields.
+
+
 
 ### 7.1 `data` — serial output
 
@@ -375,10 +447,13 @@ If the device drops, in-flight `expect`/`run` requests fail with `-32005 device_
 | `-32006` | buffer overflow (`max_bytes` exceeded without a match) |
 | `-32007` | unsupported serial operation (backend can't apply termios) |
 | `-32008` | invalid serial setting (out-of-range / unknown value) |
+| `-32009` | device not found (unknown `device_id`) |
 | `-32010` | unsupported protocol |
 | `-32011` | not initialized (called before `hello`) |
 | `-32012` | session not found |
 | `-32013` | mode conflict (policy refused) |
+| `-32014` | unauthorized (TCP token wrong) |
+| `-32015` | ambiguous device — daemon serves >1, specify `device_id` |
 | `-32800` | cancelled |
 
 ## 9. Race / ordering guarantees

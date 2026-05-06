@@ -115,7 +115,7 @@ cargo install serial-tether
 
 **Pre-built binaries via curl** (no dependencies):
 ```sh
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/hulryung/serial-tether/releases/download/v0.7.1/serial-tether-installer.sh | sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/hulryung/serial-tether/releases/download/v0.8.0/serial-tether-installer.sh | sh
 ```
 
 Or **build from source**:
@@ -171,25 +171,43 @@ connections always require a token. Run with both `-s /tmp/tetherd.sock` and
 
 ### More than one board
 
-A daemon owns one serial port. With multiple USB serial devices, run one
-daemon per port and tag each with `--name`:
+There are two ways to run several boards. Pick whichever suits the setup.
+
+**One daemon per board** (process-level isolation, simplest):
 
 ```sh
-# Terminal 1: daemon for board 0
-tetherd -D /dev/tty.usbserial-A --name board0
+tetherd -D /dev/tty.usbserial-A --name board0    # in one terminal
+tetherd -D /dev/tty.usbserial-B --name board1    # in another
 
-# Terminal 2: daemon for board 1
-tetherd -D /dev/tty.usbserial-B --name board1
-
-# Then talk to whichever you want — `--name` on the client expands to
-# /tmp/tetherd-<NAME>.sock, no need to remember sockets.
-tether --name board0 status
-tether --name board1 run "version" -u "# " --literal --timeout-ms 3000 --json
+tether --name board0 status                       # talk to board0
+tether --name board1 run "version" -u "# " --literal --timeout-ms 3000
 ```
 
-`--name` is just a convenience for the default UDS path. The plain
-`tetherd` (no `--name`) and `tether` (no flags) still use
-`/tmp/tetherd.sock` exactly like before — single-board setups don't change.
+`--name` defaults each daemon's UDS to `/tmp/tetherd-<NAME>.sock` so
+they don't collide.
+
+**One daemon, multiple devices** (single endpoint, single auth token —
+since v0.8):
+
+```sh
+# Repeat -D / --device for each port. Each spec is `[id=]path[,key=value...]`.
+tetherd \
+  -D 'board0=/dev/tty.usbserial-A' \
+  -D 'board1=/dev/tty.usbserial-B,baud=921600,parity=odd'
+
+# Clients address devices by id with -d / --device.
+tether -d board0 status
+tether -d board1 run "version" -u "# " --literal --timeout-ms 3000
+tether list-devices
+```
+
+Per-device options inside `-D`: `baud`, `data-bits`, `parity`, `stop-bits`,
+`flow`. Anything omitted falls through to the global `--baud` / `--parity` /
+etc. flags. If a client omits `--device` against a multi-device daemon
+the call returns `-32015 ambiguous_device` — pick a specific one.
+
+The plain `tetherd -D /dev/ttyX` and `tether <cmd>` (no flags) still use
+`/tmp/tetherd.sock` and the only device — single-board setups don't change.
 
 ## The one command an agent should reach for
 
@@ -222,7 +240,14 @@ bash tools/smoke_test.sh
 
 ## Status
 
-Shipped through v0.7.1:
+Shipped through v0.8.0:
+- ✅ Multi-device daemon: one `tetherd` owns N ports, addressed by `--device <id>` (v0.8.0)
+- ✅ `list_devices` RPC + `tether list-devices` CLI (v0.8.0)
+- ✅ Per-device startup config: `-D 'id=path,baud=N,parity=...'` (v0.8.0)
+- ✅ Tio-style line / break / modem control: `send_break` / `set_dtr` / `set_rts` / `read_modem_status` + shell escapes Ctrl-A B/D/R/L (v0.8.0)
+- ✅ Operator-driven port hold: `disconnect_device` / `connect_device` (v0.8.0)
+
+Through v0.7.x:
 - ✅ `list_ports` / `set_device` / live `tether config --baud` etc. (v0.7.0)
 - ✅ Shell escapes Ctrl-A C (config) / V (ports) (v0.7.0)
 - ✅ `--name <NAME>` for running multiple daemons side-by-side (v0.7.1)

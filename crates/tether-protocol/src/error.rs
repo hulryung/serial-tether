@@ -19,11 +19,13 @@ pub enum ErrorCode {
 
     UnsupportedSerialOp = -32007,
     InvalidSerialSetting = -32008,
+    DeviceNotFound = -32009,
     UnsupportedProtocol = -32010,
     NotInitialized = -32011,
     SessionNotFound = -32012,
     ModeConflict = -32013,
     Unauthorized = -32014,
+    AmbiguousDevice = -32015,
 
     Cancelled = -32800,
 }
@@ -48,11 +50,13 @@ impl ErrorCode {
             Self::BufferOverflow => "buffer overflow",
             Self::UnsupportedSerialOp => "unsupported serial operation",
             Self::InvalidSerialSetting => "invalid serial setting",
+            Self::DeviceNotFound => "device not found",
             Self::UnsupportedProtocol => "unsupported protocol",
             Self::NotInitialized => "not initialized",
             Self::SessionNotFound => "session not found",
             Self::ModeConflict => "mode conflict",
             Self::Unauthorized => "unauthorized",
+            Self::AmbiguousDevice => "ambiguous device — daemon serves >1, specify device_id",
             Self::Cancelled => "cancelled",
         }
     }

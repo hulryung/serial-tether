@@ -90,76 +90,93 @@ where
         }
     });
 
-    // Serial fan-out task — every time the buffer grows, compare each session's
-    // notify cursor and emit any pending bytes as `data` notifications.
-    let fanout_state = state.clone();
-    let fanout_conn = conn.clone();
-    let fanout_tx = out_tx.clone();
-    let fanout_task = tokio::spawn(async move {
-        loop {
-            fanout_state.buffer.wait().await;
-            for sid in fanout_conn.session_ids() {
-                let Some(session) = fanout_state.sessions.get(&sid) else { continue };
-                let cursor = session.lock().notify_cursor;
-                let (chunk, new_cursor, lag) = fanout_state.buffer.read_from(cursor);
-                if let Some(l) = lag {
-                    let _ = fanout_tx.send(Message::Notification(Notification::new(
-                        "lag",
-                        serde_json::to_value(LagNotify {
-                            session_id: sid.clone(),
-                            dropped_bytes: l.dropped_bytes,
-                            dropped_range: [l.dropped_range.0, l.dropped_range.1],
-                            resume_seq: l.resume_seq,
-                        })
-                        .unwrap(),
-                    )));
-                }
-                if !chunk.is_empty() {
-                    let seq_start = new_cursor - chunk.len() as u64;
-                    let _ = fanout_tx.send(Message::Notification(Notification::new(
-                        "data",
-                        serde_json::to_value(DataNotify {
-                            session_id: sid.clone(),
-                            seq: seq_start,
-                            data: base64::engine::general_purpose::STANDARD
-                                .encode(&chunk),
-                        })
-                        .unwrap(),
-                    )));
-                    session.lock().notify_cursor = new_cursor;
-                }
-            }
-        }
-    });
-
-    // Device-event task — subscribe to broadcast and forward as the
-    // `device` notification (PROTOCOL.md §7.5) so attached clients see
-    // disconnect/reconnect transitions without polling status.
-    let mut device_rx = state.device_events.subscribe();
-    let device_tx = out_tx.clone();
-    let device_task = tokio::spawn(async move {
-        loop {
-            match device_rx.recv().await {
-                Ok(event) => {
-                    let detail = event.detail.clone();
-                    let mut params = serde_json::json!({
-                        "kind": event.kind.as_str(),
-                    });
-                    if let Some(d) = detail {
-                        params["detail"] = serde_json::Value::String(d);
+    // Serial fan-out tasks — one per device. Each watches that device's
+    // buffer and emits `data` / `lag` notifications for any session bound
+    // to it. Phase 6 will pull this into a tighter helper, but the current
+    // shape already works for N devices.
+    let mut fanout_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    for dev in state.devices.values().cloned() {
+        let fanout_state = state.clone();
+        let fanout_conn = conn.clone();
+        let fanout_tx = out_tx.clone();
+        let dev = dev.clone();
+        fanout_tasks.push(tokio::spawn(async move {
+            loop {
+                dev.buffer.wait().await;
+                for sid in fanout_conn.session_ids() {
+                    let Some(session) = fanout_state.sessions.get(&sid) else { continue };
+                    // Skip sessions bound to a different device.
+                    if session.lock().device_id != dev.id {
+                        continue;
                     }
-                    let _ = device_tx.send(Message::Notification(Notification::new(
-                        "device", params,
-                    )));
+                    let cursor = session.lock().notify_cursor;
+                    let (chunk, new_cursor, lag) = dev.buffer.read_from(cursor);
+                    if let Some(l) = lag {
+                        let _ = fanout_tx.send(Message::Notification(Notification::new(
+                            "lag",
+                            serde_json::to_value(LagNotify {
+                                session_id: sid.clone(),
+                                dropped_bytes: l.dropped_bytes,
+                                dropped_range: [l.dropped_range.0, l.dropped_range.1],
+                                resume_seq: l.resume_seq,
+                                device_id: Some(dev.id.clone()),
+                            })
+                            .unwrap(),
+                        )));
+                    }
+                    if !chunk.is_empty() {
+                        let seq_start = new_cursor - chunk.len() as u64;
+                        let _ = fanout_tx.send(Message::Notification(Notification::new(
+                            "data",
+                            serde_json::to_value(DataNotify {
+                                session_id: sid.clone(),
+                                seq: seq_start,
+                                data: base64::engine::general_purpose::STANDARD
+                                    .encode(&chunk),
+                                device_id: Some(dev.id.clone()),
+                            })
+                            .unwrap(),
+                        )));
+                        session.lock().notify_cursor = new_cursor;
+                    }
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                    tracing::warn!(lagged = n, "device events lagged; resyncing");
-                    continue;
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }
-        }
-    });
+        }));
+    }
+
+    // Device-event tasks — one per device. Forward broadcast events as the
+    // `device` notification (PROTOCOL.md §7.5) tagged with `device_id` so
+    // multi-device clients can route them.
+    let mut device_event_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    for dev in state.devices.values().cloned() {
+        let mut device_rx = dev.events.subscribe();
+        let device_tx = out_tx.clone();
+        let dev_id = dev.id.clone();
+        device_event_tasks.push(tokio::spawn(async move {
+            loop {
+                match device_rx.recv().await {
+                    Ok(event) => {
+                        let detail = event.detail.clone();
+                        let mut params = serde_json::json!({
+                            "kind": event.kind.as_str(),
+                            "device_id": dev_id,
+                        });
+                        if let Some(d) = detail {
+                            params["detail"] = serde_json::Value::String(d);
+                        }
+                        let _ = device_tx.send(Message::Notification(Notification::new(
+                            "device", params,
+                        )));
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!(device=%dev_id, lagged = n, "device events lagged; resyncing");
+                        continue;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        }));
+    }
 
     // Message dispatch loop.
     while let Some(item) = source.next().await {
@@ -192,8 +209,8 @@ where
     }
 
     // Cleanup.
-    fanout_task.abort();
-    device_task.abort();
+    for t in &fanout_tasks { t.abort(); }
+    for t in &device_event_tasks { t.abort(); }
     drop(out_tx);
     let _ = writer_task.await;
     for sid in conn.session_ids() {
@@ -218,8 +235,15 @@ async fn dispatch(
         "run" => handlers::run(state, conn, params).await,
         "status" => handlers::status(state, conn, params).await,
         "list_ports" => handlers::list_ports(state, conn, params).await,
+        "list_devices" => handlers::list_devices(state, conn, params).await,
         "set_device" => handlers::set_device(state, conn, params).await,
         "reconnect" => handlers::reconnect(state, conn, params).await,
+        "send_break" => handlers::send_break(state, conn, params).await,
+        "set_dtr" => handlers::set_dtr(state, conn, params).await,
+        "set_rts" => handlers::set_rts(state, conn, params).await,
+        "read_modem_status" => handlers::read_modem_status(state, conn, params).await,
+        "disconnect_device" => handlers::disconnect_device(state, conn, params).await,
+        "connect_device" => handlers::connect_device(state, conn, params).await,
         _ => Err(tether_protocol::ProtocolError::new(ErrorCode::MethodNotFound)
             .with_message(format!("method not found: {method}"))),
     }

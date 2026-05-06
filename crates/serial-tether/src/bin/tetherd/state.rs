@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -8,7 +9,7 @@ use crate::buffer::RingBuffer;
 use crate::serial::{SerialConfig, SerialControl, SerialWriter};
 use crate::session::SessionManager;
 
-/// Liveness state of the underlying serial device. The serial task is the
+/// Liveness state of an underlying serial device. The serial task is the
 /// sole writer; other code reads it (for the `status` RPC, the banner, etc.).
 #[derive(Debug, Clone)]
 pub struct DeviceState {
@@ -22,6 +23,9 @@ pub struct DeviceState {
     pub disconnect_count: u64,
     /// Consecutive open failures during the current outage. Resets on success.
     pub consecutive_open_failures: u64,
+    /// Set by `disconnect_device`; the serial owner task closes the port
+    /// and stops auto-reconnecting until `connect_device` clears it.
+    pub explicitly_disconnected: bool,
 }
 
 impl DeviceState {
@@ -32,6 +36,7 @@ impl DeviceState {
             last_disconnect_reason: None,
             disconnect_count: 0,
             consecutive_open_failures: 0,
+            explicitly_disconnected: false,
         }
     }
 }
@@ -63,41 +68,100 @@ impl DeviceEventKind {
     }
 }
 
-/// Single writer lock used by `run` transactions.
+/// Per-device writer lock used by `run` transactions.
 /// `holder == None` means the lock is free; `Some(id)` means session `id`
-/// owns it.
+/// owns it. Each `Device` has its own lock — concurrent transactions on
+/// different devices never serialise against each other.
 #[derive(Default)]
 pub struct WriterLock {
     pub holder: Mutex<Option<String>>,
     pub released: Notify,
 }
 
-#[derive(Clone)]
-pub struct DaemonState {
+/// One serial port owned by the daemon. All per-device state (ring buffer,
+/// writer, serial-control mpsc, config, liveness, lock, event broadcast)
+/// lives here. `DaemonState` holds a `HashMap<id, Arc<Device>>` so handlers
+/// can route by `device_id`.
+pub struct Device {
+    /// Operator-chosen alias (e.g. "board0"). Used in CLI flags, log lines,
+    /// and as the key in `DaemonState.devices`.
+    pub id: String,
     pub buffer: RingBuffer,
     pub writer: SerialWriter,
-    /// Issues live serial-control commands (set_device, send_break, ...) to
-    /// the serial owner task.
     pub serial_control: SerialControl,
-    pub sessions: Arc<SessionManager>,
-    /// Shared, mutable serial configuration. The serial owner task is the
-    /// authoritative writer (it updates this after a successful apply); RPC
-    /// handlers read it (status/hello) and propose changes via `serial_control`.
+    /// The serial owner task is the authoritative writer; RPC handlers read
+    /// (status/hello) and propose changes via `serial_control`.
     pub config: Arc<Mutex<SerialConfig>>,
+    pub state: Arc<Mutex<DeviceState>>,
+    pub force_reconnect: Arc<Notify>,
+    pub reconnected: Arc<Notify>,
+    pub events: broadcast::Sender<DeviceEvent>,
     pub lock: Arc<WriterLock>,
+}
+
+#[derive(Clone)]
+pub struct DaemonState {
+    /// All devices the daemon currently owns. Static after startup in v0.8;
+    /// hot add/remove may come in a later release.
+    pub devices: Arc<HashMap<String, Arc<Device>>>,
+    /// Device id picked when a client omits `device_id`. With multiple
+    /// devices the handler returns `AmbiguousDevice` instead of silently
+    /// using this; `default_device` only resolves when devices.len() == 1.
+    pub default_device: String,
+    pub sessions: Arc<SessionManager>,
     /// Required by clients connecting over a transport with `requires_auth=true`
     /// (i.e., TCP). `None` means TCP listening is disabled.
     pub auth_token: Option<Arc<String>>,
-    /// Live tracking of whether the serial device is currently open. The
-    /// serial task updates this; everyone else just reads.
-    pub device_state: Arc<Mutex<DeviceState>>,
-    /// Notify the serial task to drop the current device handle and reopen
-    /// (used by the `reconnect` RPC).
-    pub force_reconnect: Arc<Notify>,
-    /// Notify when device_state transitions to connected (used by `reconnect`
-    /// to wait for the reopen to complete).
-    pub reconnected: Arc<Notify>,
-    /// Broadcast channel for device-state transitions. Each connection
-    /// subscribes once and emits `device` notifications to its clients.
-    pub device_events: broadcast::Sender<DeviceEvent>,
+}
+
+impl DaemonState {
+    /// Resolve a target device given an optional `device_id` from the wire.
+    ///
+    /// - `Some(id)` → look it up; `DeviceNotFound` if missing.
+    /// - `None` and exactly one device → that device.
+    /// - `None` and multiple devices → `AmbiguousDevice` error.
+    pub fn resolve_device(
+        &self,
+        id: Option<&str>,
+    ) -> Result<Arc<Device>, tether_protocol::ProtocolError> {
+        use tether_protocol::error::ErrorCode;
+        use tether_protocol::ProtocolError;
+        if let Some(name) = id {
+            return self.devices.get(name).cloned().ok_or_else(|| {
+                ProtocolError::new(ErrorCode::DeviceNotFound)
+                    .with_message(format!("device {name:?} not managed by this daemon"))
+            });
+        }
+        if self.devices.len() == 1 {
+            return Ok(self
+                .devices
+                .get(&self.default_device)
+                .expect("default device always present in devices map")
+                .clone());
+        }
+        Err(ProtocolError::new(ErrorCode::AmbiguousDevice).with_message(format!(
+            "daemon serves {} devices; pass device_id to select one",
+            self.devices.len()
+        )))
+    }
+
+    /// Look up a session and return both the session handle and the device
+    /// it's bound to. Used by `send`/`expect`/`run` (which take a session_id
+    /// rather than a device_id).
+    pub fn device_for_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Arc<Device>, tether_protocol::ProtocolError> {
+        use tether_protocol::error::ErrorCode;
+        use tether_protocol::ProtocolError;
+        let session = self
+            .sessions
+            .get(session_id)
+            .ok_or_else(|| ProtocolError::new(ErrorCode::SessionNotFound))?;
+        let device_id = session.lock().device_id.clone();
+        self.devices.get(&device_id).cloned().ok_or_else(|| {
+            ProtocolError::new(ErrorCode::DeviceNotFound)
+                .with_message(format!("session bound to missing device {device_id:?}"))
+        })
+    }
 }

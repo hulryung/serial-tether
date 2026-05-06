@@ -160,24 +160,56 @@ whatever the board accepts.
 
 ## Multiple boards on one host
 
-A daemon owns one port. If the host has several USB serial devices, the
-operator runs one daemon per port and tags them with `--name`:
+Two patterns supported. Both work.
+
+**A. One daemon per board** (`--name` selects which daemon):
 
 ```sh
 tetherd -D /dev/ttyUSB0 --name board0 &
 tetherd -D /dev/ttyUSB1 --name board1 &
+
+tether --name board0 status
+tether --name board1 run "version" -u "# " --literal --newline crlf --timeout-ms 3000 --json
 ```
 
-You then pass `--name` on every command instead of `-s`:
+`--name X` is shorthand for `-s /tmp/tetherd-X.sock`.
+
+**B. One daemon, multiple devices** (`--device` / `-d` selects which
+device-in-daemon, since v0.8):
 
 ```sh
-tether --name board0 status
-tether --name board0 run "version" -u "# " --literal --newline crlf --timeout-ms 3000 --json
-tether --name board1 sync
+# Each -D is `[id=]path[,key=value,...]`. Per-device baud / parity /
+# data-bits / stop-bits / flow override the global flags.
+tetherd \
+  -D 'board0=/dev/ttyUSB0' \
+  -D 'board1=/dev/ttyUSB1,baud=921600' &
+
+# Address devices by id.
+tether -d board0 status
+tether -d board0 run "version" -u "# " --literal --newline crlf
+tether -d board1 sync
+tether list-devices         # daemon-wide; no -d needed
 ```
 
-`--name X` is shorthand for `-s /tmp/tetherd-X.sock`. Don't mix the two
-on the same call — clap will reject it.
+Multi-device daemons answer `-32015 ambiguous_device` if `--device`
+is missing and >1 device is managed. Single-device daemons fall back
+to the only device, so `--device` is optional in that case.
+
+## Tio-style line / break / modem control (since v0.8)
+
+```sh
+tether break --duration-ms 250            # send a BREAK pulse
+tether dtr on                             # assert DTR
+tether dtr off                            # deassert
+tether rts on                             # assert RTS
+tether lines                              # → CTS=1 DSR=0 RI=0 DCD=1
+tether disconnect                         # explicit close (parks port)
+tether connect                            # release the hold, reopen
+```
+
+All take `--device` on multi-device daemons. The Fd backend (PTYs,
+pipes) returns `-32007 unsupported_serial_op` for break / dtr / rts /
+lines.
 
 ## Remote daemons (over a network)
 

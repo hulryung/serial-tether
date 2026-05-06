@@ -130,9 +130,20 @@ impl FlowControl {
     }
 }
 
-/// Control commands sent into the serial owner task. Used by `set_device`,
-/// (and later v0.8) `set_break`, `set_dtr`, `set_rts`, `read_modem_status`.
+/// Snapshot of the four input modem status lines. Filled by
+/// `read_modem_status`. Returns Ok on the Real backend (tokio_serial), Err
+/// (Unsupported) on the Fd backend.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ModemStatus {
+    pub cts: bool,
+    pub dsr: bool,
+    pub ri: bool,
+    pub dcd: bool,
+}
+
+/// Control commands sent into the serial owner task.
 pub enum ControlMsg {
+    /// Apply a partial settings update via `set_device`.
     Apply {
         baud: Option<u32>,
         data_bits: Option<DataBits>,
@@ -141,11 +152,60 @@ pub enum ControlMsg {
         flow_control: Option<FlowControl>,
         ack: tokio::sync::oneshot::Sender<Result<(), std::io::Error>>,
     },
+    /// Pulse a serial break for the given duration. tio's default is 250ms.
+    SendBreak {
+        duration_ms: u32,
+        ack: tokio::sync::oneshot::Sender<Result<(), std::io::Error>>,
+    },
+    /// Drive the DTR (Data Terminal Ready) output line.
+    SetDtr {
+        on: bool,
+        ack: tokio::sync::oneshot::Sender<Result<(), std::io::Error>>,
+    },
+    /// Drive the RTS (Request To Send) output line.
+    SetRts {
+        on: bool,
+        ack: tokio::sync::oneshot::Sender<Result<(), std::io::Error>>,
+    },
+    /// Read the four input modem status lines (CTS / DSR / RI / DCD).
+    ReadModem {
+        ack: tokio::sync::oneshot::Sender<Result<ModemStatus, std::io::Error>>,
+    },
+    /// Explicitly close the device. The owner task drops the open port and
+    /// stops auto-reconnecting until `Connect` arrives. Used by
+    /// `disconnect_device`.
+    Disconnect {
+        ack: tokio::sync::oneshot::Sender<Result<(), std::io::Error>>,
+    },
+    /// Lift the explicit-disconnect flag and force an immediate reopen.
+    /// Used by `connect_device`.
+    Connect {
+        ack: tokio::sync::oneshot::Sender<Result<(), std::io::Error>>,
+    },
 }
 
 #[derive(Clone)]
 pub struct SerialControl {
     tx: mpsc::Sender<ControlMsg>,
+}
+
+/// Helper: send a ControlMsg variant and await the ack. Centralises the
+/// "channel closed" / "ack dropped" wiring so each public method stays
+/// short.
+async fn ctrl_send_unit(
+    tx: &mpsc::Sender<ControlMsg>,
+    build: impl FnOnce(tokio::sync::oneshot::Sender<Result<(), std::io::Error>>) -> ControlMsg,
+) -> Result<(), std::io::Error> {
+    let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+    if tx.send(build(ack_tx)).await.is_err() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "serial task gone",
+        ));
+    }
+    ack_rx.await.map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::BrokenPipe, "serial task dropped")
+    })?
 }
 
 impl SerialControl {
@@ -157,20 +217,32 @@ impl SerialControl {
         stop_bits: Option<StopBits>,
         flow_control: Option<FlowControl>,
     ) -> Result<(), std::io::Error> {
+        ctrl_send_unit(&self.tx, |ack| ControlMsg::Apply {
+            baud,
+            data_bits,
+            parity,
+            stop_bits,
+            flow_control,
+            ack,
+        })
+        .await
+    }
+
+    pub async fn send_break(&self, duration_ms: u32) -> Result<(), std::io::Error> {
+        ctrl_send_unit(&self.tx, |ack| ControlMsg::SendBreak { duration_ms, ack }).await
+    }
+
+    pub async fn set_dtr(&self, on: bool) -> Result<(), std::io::Error> {
+        ctrl_send_unit(&self.tx, |ack| ControlMsg::SetDtr { on, ack }).await
+    }
+
+    pub async fn set_rts(&self, on: bool) -> Result<(), std::io::Error> {
+        ctrl_send_unit(&self.tx, |ack| ControlMsg::SetRts { on, ack }).await
+    }
+
+    pub async fn read_modem(&self) -> Result<ModemStatus, std::io::Error> {
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
-        if self
-            .tx
-            .send(ControlMsg::Apply {
-                baud,
-                data_bits,
-                parity,
-                stop_bits,
-                flow_control,
-                ack: ack_tx,
-            })
-            .await
-            .is_err()
-        {
+        if self.tx.send(ControlMsg::ReadModem { ack: ack_tx }).await.is_err() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,
                 "serial task gone",
@@ -179,6 +251,14 @@ impl SerialControl {
         ack_rx.await.map_err(|_| {
             std::io::Error::new(std::io::ErrorKind::BrokenPipe, "serial task dropped")
         })?
+    }
+
+    pub async fn disconnect(&self) -> Result<(), std::io::Error> {
+        ctrl_send_unit(&self.tx, |ack| ControlMsg::Disconnect { ack }).await
+    }
+
+    pub async fn connect(&self) -> Result<(), std::io::Error> {
+        ctrl_send_unit(&self.tx, |ack| ControlMsg::Connect { ack }).await
     }
 }
 
@@ -345,6 +425,41 @@ pub fn spawn(
         let mut emit_disconnect = false;
 
         loop {
+            // If the operator has explicitly disconnected this device
+            // (`disconnect_device` RPC), park here. The port is closed and
+            // we don't auto-reopen until `connect_device` clears the flag.
+            if state.lock().explicitly_disconnected {
+                tracing::info!(path = %cfg.lock().path, "device parked (explicitly disconnected)");
+                loop {
+                    tokio::select! {
+                        Some(job) = rx.recv() => {
+                            let _ = job.ack.send(Err(std::io::Error::new(
+                                std::io::ErrorKind::NotConnected,
+                                "device explicitly disconnected",
+                            )));
+                        }
+                        Some(msg) = ctrl_rx.recv() => {
+                            match handle_ctrl_closed(msg, &cfg, &state) {
+                                CtrlOutcome::Continue => {}
+                                CtrlOutcome::ExitSession(_) => {
+                                    // `Connect` clears the flag and asks us
+                                    // to retry. Apply during park kicks the
+                                    // same way (it'll re-park immediately if
+                                    // the flag is still set, e.g. another
+                                    // Disconnect arrived first).
+                                    if !state.lock().explicitly_disconnected {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // Drop straight into the open loop — backoff resets so the
+                // first reconnect attempt happens immediately.
+                backoff = initial_backoff;
+            }
+
             // Snapshot the latest config before each open, so a `set_device`
             // applied while we were waiting to reconnect actually takes effect.
             let snapshot = cfg.lock().clone();
@@ -405,19 +520,13 @@ pub fn spawn(
                                     )));
                                 }
                                 Some(msg) = ctrl_rx.recv() => {
-                                    let ControlMsg::Apply { baud, data_bits, parity, stop_bits, flow_control, ack } = msg;
-                                    {
-                                        let mut c = cfg.lock();
-                                        if let Some(v) = baud { c.baud = v; }
-                                        if let Some(v) = data_bits { c.data_bits = v; }
-                                        if let Some(v) = parity { c.parity = v; }
-                                        if let Some(v) = stop_bits { c.stop_bits = v; }
-                                        if let Some(v) = flow_control { c.flow_control = v; }
+                                    match handle_ctrl_closed(msg, &cfg, &state) {
+                                        CtrlOutcome::Continue => {}
+                                        // Apply / Connect both kick the outer loop to
+                                        // retry the open immediately rather than wait
+                                        // out the backoff sleep.
+                                        CtrlOutcome::ExitSession(_) => break,
                                     }
-                                    let _ = ack.send(Ok(()));
-                                    // Restart the open loop with the new config
-                                    // immediately rather than waiting for backoff.
-                                    break;
                                 }
                             }
                         }
@@ -435,6 +544,7 @@ pub fn spawn(
                 &mut rx,
                 &mut ctrl_rx,
                 &cfg,
+                &state,
                 &force_reconnect,
             )
             .await;
@@ -493,6 +603,217 @@ fn serialport_to_io(e: tokio_serial::Error) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
 }
 
+/// Persist a successful Apply into the shared config so the next reopen
+/// (if any) uses the new settings.
+fn write_apply_to_cfg(
+    cfg: &Arc<Mutex<SerialConfig>>,
+    baud: Option<u32>,
+    data_bits: Option<DataBits>,
+    parity: Option<Parity>,
+    stop_bits: Option<StopBits>,
+    flow_control: Option<FlowControl>,
+) {
+    let mut c = cfg.lock();
+    if let Some(v) = baud { c.baud = v; }
+    if let Some(v) = data_bits { c.data_bits = v; }
+    if let Some(v) = parity { c.parity = v; }
+    if let Some(v) = stop_bits { c.stop_bits = v; }
+    if let Some(v) = flow_control { c.flow_control = v; }
+}
+
+/// Read the four input modem status lines from a tokio-serial port.
+fn read_modem_real(s: &mut tokio_serial::SerialStream) -> std::io::Result<ModemStatus> {
+    use tokio_serial::SerialPort as _;
+    Ok(ModemStatus {
+        cts: s.read_clear_to_send().map_err(serialport_to_io)?,
+        dsr: s.read_data_set_ready().map_err(serialport_to_io)?,
+        ri: s.read_ring_indicator().map_err(serialport_to_io)?,
+        dcd: s.read_carrier_detect().map_err(serialport_to_io)?,
+    })
+}
+
+/// Outcome of dispatching a ControlMsg.
+enum CtrlOutcome {
+    /// Continue the current loop — handled inline.
+    Continue,
+    /// Caller should exit `run_io_session` with this reason. Used by
+    /// `Disconnect` to release the open port back to the outer loop, which
+    /// will then see `state.explicitly_disconnected` and park.
+    ExitSession(String),
+}
+
+/// Handle one ControlMsg against a live Real port. Hardware operations
+/// (break / dtr / rts / modem) work; Apply is committed and persisted.
+/// Disconnect sets the `explicitly_disconnected` flag and asks the caller
+/// to drop the port. Connect on a connected port is a no-op success.
+async fn handle_ctrl_real(
+    s: &mut tokio_serial::SerialStream,
+    msg: ControlMsg,
+    cfg: &Arc<Mutex<SerialConfig>>,
+    state: &Arc<Mutex<DeviceState>>,
+) -> CtrlOutcome {
+    use tokio_serial::SerialPort as _;
+    match msg {
+        ControlMsg::Apply {
+            baud,
+            data_bits,
+            parity,
+            stop_bits,
+            flow_control,
+            ack,
+        } => {
+            match apply_to_real(s, baud, data_bits, parity, stop_bits, flow_control) {
+                Ok(()) => {
+                    write_apply_to_cfg(cfg, baud, data_bits, parity, stop_bits, flow_control);
+                    let _ = ack.send(Ok(()));
+                }
+                Err(e) => {
+                    let _ = ack.send(Err(e));
+                }
+            }
+            CtrlOutcome::Continue
+        }
+        ControlMsg::SendBreak { duration_ms, ack } => {
+            // tio's behavior: assert break, sleep, deassert. We do this without
+            // releasing the select! because writes/reads against the port while
+            // break is asserted are the operator's intent (mostly nothing).
+            let res = (|| -> std::io::Result<()> {
+                s.set_break().map_err(serialport_to_io)?;
+                Ok(())
+            })();
+            if let Err(e) = res {
+                let _ = ack.send(Err(e));
+                return CtrlOutcome::Continue;
+            }
+            tokio::time::sleep(Duration::from_millis(duration_ms as u64)).await;
+            let res = s.clear_break().map_err(serialport_to_io);
+            let _ = ack.send(res);
+            CtrlOutcome::Continue
+        }
+        ControlMsg::SetDtr { on, ack } => {
+            let _ = ack.send(s.write_data_terminal_ready(on).map_err(serialport_to_io));
+            CtrlOutcome::Continue
+        }
+        ControlMsg::SetRts { on, ack } => {
+            let _ = ack.send(s.write_request_to_send(on).map_err(serialport_to_io));
+            CtrlOutcome::Continue
+        }
+        ControlMsg::ReadModem { ack } => {
+            let _ = ack.send(read_modem_real(s));
+            CtrlOutcome::Continue
+        }
+        ControlMsg::Disconnect { ack } => {
+            state.lock().explicitly_disconnected = true;
+            let _ = ack.send(Ok(()));
+            CtrlOutcome::ExitSession("explicit disconnect".into())
+        }
+        ControlMsg::Connect { ack } => {
+            // Already connected — clearing the flag is defensive.
+            state.lock().explicitly_disconnected = false;
+            let _ = ack.send(Ok(()));
+            CtrlOutcome::Continue
+        }
+    }
+}
+
+/// Same as `handle_ctrl_real` but for the Fd backend (PTYs, pipes, etc.).
+/// Hardware control returns `Unsupported`; Apply / Disconnect / Connect
+/// behave the same as on Real.
+async fn handle_ctrl_fd(
+    msg: ControlMsg,
+    cfg: &Arc<Mutex<SerialConfig>>,
+    state: &Arc<Mutex<DeviceState>>,
+) -> CtrlOutcome {
+    let unsupported =
+        || std::io::Error::new(std::io::ErrorKind::Unsupported, "device backend doesn't support this");
+    match msg {
+        ControlMsg::Apply {
+            baud,
+            data_bits,
+            parity,
+            stop_bits,
+            flow_control,
+            ack,
+        } => {
+            // Fd backend can't apply termios, but we still update the shared
+            // config so a future re-open against a Real backend would honor
+            // it. This matches v0.7 behavior.
+            write_apply_to_cfg(cfg, baud, data_bits, parity, stop_bits, flow_control);
+            let _ = ack.send(Err(unsupported()));
+            CtrlOutcome::Continue
+        }
+        ControlMsg::SendBreak { ack, .. }
+        | ControlMsg::SetDtr { ack, .. }
+        | ControlMsg::SetRts { ack, .. } => {
+            let _ = ack.send(Err(unsupported()));
+            CtrlOutcome::Continue
+        }
+        ControlMsg::ReadModem { ack } => {
+            let _ = ack.send(Err(unsupported()));
+            CtrlOutcome::Continue
+        }
+        ControlMsg::Disconnect { ack } => {
+            state.lock().explicitly_disconnected = true;
+            let _ = ack.send(Ok(()));
+            CtrlOutcome::ExitSession("explicit disconnect".into())
+        }
+        ControlMsg::Connect { ack } => {
+            state.lock().explicitly_disconnected = false;
+            let _ = ack.send(Ok(()));
+            CtrlOutcome::Continue
+        }
+    }
+}
+
+/// Handle a ControlMsg while the device is *closed* (between sessions, in
+/// the outer reconnect/park loop). Most hardware ops return NotConnected;
+/// Apply persists into shared cfg; Disconnect sets the flag (no-op-ish);
+/// Connect clears it and signals "kick the outer loop to retry".
+fn handle_ctrl_closed(
+    msg: ControlMsg,
+    cfg: &Arc<Mutex<SerialConfig>>,
+    state: &Arc<Mutex<DeviceState>>,
+) -> CtrlOutcome {
+    let not_connected =
+        || std::io::Error::new(std::io::ErrorKind::NotConnected, "device disconnected");
+    match msg {
+        ControlMsg::Apply {
+            baud,
+            data_bits,
+            parity,
+            stop_bits,
+            flow_control,
+            ack,
+        } => {
+            // Persist for next reopen, then ask the outer loop to retry now.
+            write_apply_to_cfg(cfg, baud, data_bits, parity, stop_bits, flow_control);
+            let _ = ack.send(Ok(()));
+            CtrlOutcome::ExitSession("apply during disconnect — kick reopen".into())
+        }
+        ControlMsg::SendBreak { ack, .. }
+        | ControlMsg::SetDtr { ack, .. }
+        | ControlMsg::SetRts { ack, .. } => {
+            let _ = ack.send(Err(not_connected()));
+            CtrlOutcome::Continue
+        }
+        ControlMsg::ReadModem { ack } => {
+            let _ = ack.send(Err(not_connected()));
+            CtrlOutcome::Continue
+        }
+        ControlMsg::Disconnect { ack } => {
+            state.lock().explicitly_disconnected = true;
+            let _ = ack.send(Ok(()));
+            CtrlOutcome::Continue
+        }
+        ControlMsg::Connect { ack } => {
+            state.lock().explicitly_disconnected = false;
+            let _ = ack.send(Ok(()));
+            // Tell the outer loop to break out of park / sleep and retry.
+            CtrlOutcome::ExitSession("operator connect — kick reopen".into())
+        }
+    }
+}
+
 /// Per-session IO loop. Returns when the device disconnects (or we're forced
 /// to reconnect). The string is a short reason for diagnostics.
 async fn run_io_session(
@@ -501,6 +822,7 @@ async fn run_io_session(
     rx: &mut mpsc::Receiver<WriteJob>,
     ctrl_rx: &mut mpsc::Receiver<ControlMsg>,
     cfg: &Arc<Mutex<SerialConfig>>,
+    state: &Arc<Mutex<DeviceState>>,
     force_reconnect: &Notify,
 ) -> String {
     match port {
@@ -512,20 +834,9 @@ async fn run_io_session(
                     _ = force_reconnect.notified() => return "forced reconnect".to_string(),
                     msg = ctrl_rx.recv() => {
                         let Some(msg) = msg else { return "control channel closed".into() };
-                        let ControlMsg::Apply { baud, data_bits, parity, stop_bits, flow_control, ack } = msg;
-                        match apply_to_real(&mut s, baud, data_bits, parity, stop_bits, flow_control) {
-                            Ok(()) => {
-                                {
-                                    let mut c = cfg.lock();
-                                    if let Some(v) = baud { c.baud = v; }
-                                    if let Some(v) = data_bits { c.data_bits = v; }
-                                    if let Some(v) = parity { c.parity = v; }
-                                    if let Some(v) = stop_bits { c.stop_bits = v; }
-                                    if let Some(v) = flow_control { c.flow_control = v; }
-                                }
-                                let _ = ack.send(Ok(()));
-                            }
-                            Err(e) => { let _ = ack.send(Err(e)); }
+                        match handle_ctrl_real(&mut s, msg, cfg, state).await {
+                            CtrlOutcome::Continue => {}
+                            CtrlOutcome::ExitSession(reason) => return reason,
                         }
                     }
                     job = rx.recv() => {
@@ -557,14 +868,10 @@ async fn run_io_session(
                     _ = force_reconnect.notified() => return "forced reconnect".to_string(),
                     msg = ctrl_rx.recv() => {
                         let Some(msg) = msg else { return "control channel closed".into() };
-                        let ControlMsg::Apply { ack, .. } = msg;
-                        // The Fd backend covers PTYs and pipes that don't accept
-                        // termios changes. Surface this as UnsupportedSerialOp
-                        // to the caller.
-                        let _ = ack.send(Err(std::io::Error::new(
-                            std::io::ErrorKind::Unsupported,
-                            "device does not support runtime serial config changes",
-                        )));
+                        match handle_ctrl_fd(msg, cfg, state).await {
+                            CtrlOutcome::Continue => {}
+                            CtrlOutcome::ExitSession(reason) => return reason,
+                        }
                     }
                     job = rx.recv() => {
                         let Some(job) = job else { return "writer channel closed".into() };

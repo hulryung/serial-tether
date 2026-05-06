@@ -105,6 +105,39 @@ pub struct DeviceInfo {
     pub flow_control: String,
     #[serde(default = "default_connected")]
     pub connected: bool,
+    /// Daemon-internal device id (operator-chosen, e.g. `"board0"`). Absent
+    /// in single-device daemons that pre-date multi-device support; new
+    /// daemons always populate this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+}
+
+/// Compact summary used in `list_devices` and the new `StatusResult.devices`
+/// field. Mirrors `DeviceInfo` but drops the redundant defaults so the list
+/// stays small when N is large.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeviceSummary {
+    pub id: String,
+    pub path: String,
+    pub baud: u32,
+    pub data_bits: u8,
+    pub parity: String,
+    pub stop_bits: u8,
+    pub flow_control: String,
+    pub connected: bool,
+    /// True when the operator (or `disconnect_device` RPC) has explicitly
+    /// closed the port; auto-reconnect is paused until `connect_device`.
+    #[serde(default)]
+    pub explicitly_disconnected: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListDevicesResult {
+    pub devices: Vec<DeviceSummary>,
+    /// The daemon's "default" device — the one selected when a client omits
+    /// `device_id`. Only meaningful when `devices.len() == 1`; for N>1
+    /// daemons, clients must specify `device_id` explicitly.
+    pub default_device: String,
 }
 
 fn default_data_bits() -> u8 { 8 }
@@ -143,6 +176,9 @@ pub struct ListPortsResult {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SetDeviceParams {
+    /// Which device to apply to. Optional in single-device daemons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<String>,
     /// New baud rate (e.g. 9600, 115200, 921600). Optional.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub baud: Option<u32>,
@@ -163,6 +199,95 @@ pub struct SetDeviceParams {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SetDeviceResult {
     pub device: DeviceInfo,
+}
+
+// ---------- Reconnect ----------
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ReconnectParams {
+    /// Optional device target. Required on multi-device daemons (>1 device).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<String>,
+    /// Block until the device reopens (default true).
+    #[serde(default = "default_true")]
+    pub wait: bool,
+    /// How long to wait before giving up. Default 5000.
+    #[serde(default = "default_reconnect_timeout_ms")]
+    pub timeout_ms: u32,
+}
+
+fn default_reconnect_timeout_ms() -> u32 { 5000 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReconnectResult {
+    pub triggered: bool,
+    pub reconnected: bool,
+    pub device_connected: bool,
+}
+
+// ---------- Tio-style line / break / modem control (since v0.8) ----------
+
+/// Parameters that just identify a target device. Used by the simpler
+/// per-device control RPCs.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DeviceTarget {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<String>,
+}
+
+/// Empty acknowledgement returned by control RPCs that don't carry a value.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AckResult {
+    /// Always `true` on success; carries no extra info today, but having a
+    /// non-empty struct lets us add fields later without breaking clients.
+    #[serde(default = "default_true")]
+    pub ok: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SendBreakParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<String>,
+    /// Break duration in milliseconds. Defaults to 250 (matches tio).
+    #[serde(default = "default_break_ms")]
+    pub duration_ms: u32,
+}
+
+fn default_break_ms() -> u32 { 250 }
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SetLineParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<String>,
+    /// `true` asserts the line; `false` deasserts.
+    pub on: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ReadModemStatusResult {
+    /// Clear To Send.
+    pub cts: bool,
+    /// Data Set Ready.
+    pub dsr: bool,
+    /// Ring Indicator.
+    pub ri: bool,
+    /// Data Carrier Detect.
+    pub dcd: bool,
+}
+
+// ---------- Explicit connect / disconnect (since v0.8) ----------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DisconnectDeviceResult {
+    pub device: DeviceInfo,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConnectDeviceResult {
+    pub device: DeviceInfo,
+    /// True if the port was successfully reopened. Mirrors the existing
+    /// `reconnect` semantics; `device.connected` reflects the final state.
+    pub connected: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -202,6 +327,11 @@ pub struct AttachParams {
     pub label: Option<String>,
     #[serde(default = "default_flow_control")]
     pub flow_control: String,     // "drop_oldest" | "disconnect"
+    /// Which daemon-managed device to attach to. Single-device daemons may
+    /// omit this. Multi-device daemons return `AmbiguousDevice` when
+    /// missing and the daemon serves >1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<String>,
 }
 
 fn default_flow_control() -> String { "drop_oldest".into() }
@@ -355,19 +485,51 @@ pub struct LockState {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusResult {
+    /// Default device's info, kept for v0.7 backwards compatibility.
+    /// Multi-device daemons populate this with the device tagged as default.
+    pub device: DeviceInfo,
+    /// Default device's buffer state — same backwards-compat reasoning.
+    pub buffer: BufferInfo,
+    pub lock: LockState,
+    pub sessions: Vec<SessionInfo>,
+    /// Per-device snapshot for multi-device daemons. Single-device daemons
+    /// populate this with one entry (the same device as `device` above).
+    /// Absent on pre-v0.8 daemons.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub devices: Vec<DeviceStatus>,
+    /// Daemon-internal id of the default device. Absent on pre-v0.8 daemons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_device: Option<String>,
+}
+
+/// One row of `StatusResult.devices` — same structure as `device + buffer +
+/// lock + sessions`, scoped to a single device.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeviceStatus {
+    pub id: String,
     pub device: DeviceInfo,
     pub buffer: BufferInfo,
     pub lock: LockState,
     pub sessions: Vec<SessionInfo>,
+    /// True when the operator has explicitly disconnected this device
+    /// (via `disconnect_device`); auto-reconnect is paused.
+    #[serde(default)]
+    pub explicitly_disconnected: bool,
 }
 
 // ---------- Notification parameters ----------
+//
+// Every notification gained an optional `device_id` field in v0.8 so
+// multi-device daemons can route them. Single-device daemons may omit it
+// (clients ignore unknown / absent fields per the JSON-RPC etiquette).
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DataNotify {
     pub session_id: String,
     pub seq: u64,
     pub data: String,             // base64
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -376,6 +538,8 @@ pub struct LagNotify {
     pub dropped_bytes: u64,
     pub dropped_range: [u64; 2],
     pub resume_seq: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -385,6 +549,8 @@ pub struct LockNotify {
     pub holder_session_id: Option<String>,
     #[serde(default)]
     pub queue_depth: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -393,6 +559,8 @@ pub struct SessionNotify {
     pub kind: String,             // "attached" | "detached" | "preempted"
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -400,6 +568,8 @@ pub struct DeviceNotify {
     pub kind: String,             // "disconnected" | "reconnected" | "config_changed"
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<String>,
 }
 
 // ---------- Helpers ----------

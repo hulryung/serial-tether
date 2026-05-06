@@ -54,6 +54,9 @@ impl FlowControl {
 #[derive(Debug)]
 pub struct Session {
     pub id: String,
+    /// Daemon-internal id of the device this session is bound to. Cursors
+    /// below are positions in *this device's* ring buffer.
+    pub device_id: String,
     pub label: Option<String>,
     pub mode: SessionMode,
     /// Stored for v0.3 (used by the planned `disconnect` flow-control policy).
@@ -90,6 +93,7 @@ impl SessionManager {
 
     pub fn create(
         &self,
+        device_id: String,
         mode: SessionMode,
         flow_control: FlowControl,
         label: Option<String>,
@@ -98,6 +102,7 @@ impl SessionManager {
         let id = Uuid::now_v7().to_string();
         let s = Arc::new(Mutex::new(Session {
             id: id.clone(),
+            device_id,
             label,
             mode,
             flow_control,
@@ -122,6 +127,23 @@ impl SessionManager {
             .lock()
             .values()
             .map(|s| s.lock().to_info(head_seq))
+            .collect()
+    }
+
+    /// Like `snapshot`, but only returns sessions bound to the given device.
+    /// `head_seq` should be that device's ring-buffer head.
+    pub fn snapshot_for_device(&self, head_seq: u64, device_id: &str) -> Vec<SessionInfo> {
+        self.inner
+            .lock()
+            .values()
+            .filter_map(|s| {
+                let g = s.lock();
+                if g.device_id == device_id {
+                    Some(g.to_info(head_seq))
+                } else {
+                    None
+                }
+            })
             .collect()
     }
 }

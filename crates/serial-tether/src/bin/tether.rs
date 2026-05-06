@@ -47,6 +47,13 @@ struct Cli {
     #[arg(long, global = true, value_name = "NAME")]
     name: Option<String>,
 
+    /// Target device id within the daemon. Required when the daemon serves
+    /// more than one device (otherwise the daemon answers `AmbiguousDevice`).
+    /// Single-device daemons may omit this — it falls through to the only
+    /// device. Distinct from `--name` (which selects which *daemon*).
+    #[arg(short = 'd', long, global = true, value_name = "ID")]
+    device_id: Option<String>,
+
     /// Emit raw JSON output instead of human-readable form.
     #[arg(long, global = true)]
     json: bool,
@@ -188,6 +195,37 @@ enum Cmd {
         #[arg(long, default_value_t = 5000)]
         timeout_ms: u32,
     },
+    /// List all devices managed by the daemon.
+    ///
+    /// AI-agent tip: pair with `--json`. Output also tells you which id is
+    /// the default (used when `--device` is omitted on single-device daemons).
+    #[command(name = "list-devices")]
+    ListDevices,
+    /// Send a serial BREAK pulse to the device.
+    Break {
+        /// Break duration. Default 250ms (matches tio).
+        #[arg(long, default_value_t = 250)]
+        duration_ms: u32,
+    },
+    /// Drive the DTR (Data Terminal Ready) output line.
+    Dtr {
+        /// `on` asserts the line; `off` deasserts.
+        #[arg(value_parser = ["on", "off"])]
+        state: String,
+    },
+    /// Drive the RTS (Request To Send) output line.
+    Rts {
+        #[arg(value_parser = ["on", "off"])]
+        state: String,
+    },
+    /// Read the four input modem status lines (CTS / DSR / RI / DCD).
+    Lines,
+    /// Explicitly close the serial port. The daemon stops auto-reconnecting
+    /// until `tether connect` lifts the hold.
+    Disconnect,
+    /// Reopen a port closed by `tether disconnect`. Has no effect if the
+    /// device wasn't explicitly disconnected.
+    Connect,
 }
 
 fn main() -> ExitCode {
@@ -492,7 +530,7 @@ where
             print_json_or_pairs(&v, cli.json);
         }
         Cmd::Send { data, base64: is_b64, newline } => {
-            let session_id = attach(&mut framed, &mut next_id, "now").await?;
+            let session_id = attach(&mut framed, &mut next_id, "now", cli.device_id.as_deref()).await?;
             let mut p = SendParams {
                 session_id: session_id.clone(),
                 data: None,
@@ -521,7 +559,7 @@ where
             strip_ansi,
             max_output_bytes,
         } => {
-            let session_id = attach(&mut framed, &mut next_id, "now").await?;
+            let session_id = attach(&mut framed, &mut next_id, "now", cli.device_id.as_deref()).await?;
             let p = ExpectParams {
                 session_id,
                 pattern: pattern.clone(),
@@ -563,7 +601,7 @@ where
             preempt,
             newline,
         } => {
-            let session_id = attach(&mut framed, &mut next_id, "now").await?;
+            let session_id = attach(&mut framed, &mut next_id, "now", cli.device_id.as_deref()).await?;
             let p = RunParams {
                 session_id,
                 data: None,
@@ -599,11 +637,11 @@ where
             }
         }
         Cmd::Tail { from } => {
-            let session_id = attach(&mut framed, &mut next_id, &from).await?;
+            let session_id = attach(&mut framed, &mut next_id, &from, cli.device_id.as_deref()).await?;
             tail_loop(&mut framed, &session_id).await?;
         }
         Cmd::Shell { from } => {
-            let session_id = attach(&mut framed, &mut next_id, &from).await?;
+            let session_id = attach(&mut framed, &mut next_id, &from, cli.device_id.as_deref()).await?;
             shell_loop(framed, session_id).await?;
             return Ok(());
         }
@@ -641,16 +679,11 @@ where
             }
         }
         Cmd::Reconnect { nowait, timeout_ms } => {
-            let v = call(
-                &mut framed,
-                &mut next_id,
-                "reconnect",
-                json!({
-                    "wait": !nowait,
-                    "timeout_ms": timeout_ms,
-                }),
-            )
-            .await?;
+            let mut p = serde_json::Map::new();
+            if let Some(d) = &cli.device_id { p.insert("device_id".into(), json!(d)); }
+            p.insert("wait".into(), json!(!nowait));
+            p.insert("timeout_ms".into(), json!(timeout_ms));
+            let v = call(&mut framed, &mut next_id, "reconnect", Value::Object(p)).await?;
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
             } else {
@@ -668,8 +701,66 @@ where
                 }
             }
         }
+        Cmd::ListDevices => {
+            let v = call(&mut framed, &mut next_id, "list_devices", json!({})).await?;
+            print_device_list(&v, cli.json);
+        }
+        Cmd::Break { duration_ms } => {
+            let mut p = serde_json::Map::new();
+            if let Some(d) = &cli.device_id { p.insert("device_id".into(), json!(d)); }
+            p.insert("duration_ms".into(), json!(duration_ms));
+            let v = call(&mut framed, &mut next_id, "send_break", Value::Object(p)).await?;
+            print_json_or_pairs(&v, cli.json);
+        }
+        Cmd::Dtr { state } => {
+            let on = state == "on";
+            let mut p = serde_json::Map::new();
+            if let Some(d) = &cli.device_id { p.insert("device_id".into(), json!(d)); }
+            p.insert("on".into(), json!(on));
+            let v = call(&mut framed, &mut next_id, "set_dtr", Value::Object(p)).await?;
+            print_json_or_pairs(&v, cli.json);
+        }
+        Cmd::Rts { state } => {
+            let on = state == "on";
+            let mut p = serde_json::Map::new();
+            if let Some(d) = &cli.device_id { p.insert("device_id".into(), json!(d)); }
+            p.insert("on".into(), json!(on));
+            let v = call(&mut framed, &mut next_id, "set_rts", Value::Object(p)).await?;
+            print_json_or_pairs(&v, cli.json);
+        }
+        Cmd::Lines => {
+            let mut p = serde_json::Map::new();
+            if let Some(d) = &cli.device_id { p.insert("device_id".into(), json!(d)); }
+            let v = call(&mut framed, &mut next_id, "read_modem_status", Value::Object(p)).await?;
+            print_modem_status(&v, cli.json);
+        }
+        Cmd::Disconnect => {
+            let mut p = serde_json::Map::new();
+            if let Some(d) = &cli.device_id { p.insert("device_id".into(), json!(d)); }
+            let v = call(&mut framed, &mut next_id, "disconnect_device", Value::Object(p)).await?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+            } else {
+                eprintln!("tether: device disconnected (auto-reconnect paused)");
+            }
+        }
+        Cmd::Connect => {
+            let mut p = serde_json::Map::new();
+            if let Some(d) = &cli.device_id { p.insert("device_id".into(), json!(d)); }
+            let v = call(&mut framed, &mut next_id, "connect_device", Value::Object(p)).await?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+            } else {
+                let connected = v.get("connected").and_then(|b| b.as_bool()).unwrap_or(false);
+                if connected {
+                    eprintln!("tether: device reopened");
+                } else {
+                    eprintln!("tether: connect requested but device is still closed");
+                }
+            }
+        }
         Cmd::Sync { idle_ms, timeout_ms } => {
-            let session_id = attach(&mut framed, &mut next_id, "now").await?;
+            let session_id = attach(&mut framed, &mut next_id, "now", cli.device_id.as_deref()).await?;
             // Send a single CR.
             call(
                 &mut framed,
@@ -703,6 +794,7 @@ async fn attach<S>(
     framed: &mut Framed<S, NdjsonCodec>,
     next_id: &mut i64,
     replay: &str,
+    device_id: Option<&str>,
 ) -> Result<String, CliError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -713,6 +805,7 @@ where
         replay: tether_protocol::message::ReplaySpec::Named(replay.into()),
         label: Some("tether".into()),
         flow_control: "drop_oldest".into(),
+        device_id: device_id.map(|s| s.to_string()),
     };
     let v = call(framed, next_id, "attach", serde_json::to_value(p).unwrap()).await?;
     let id = v
@@ -906,7 +999,7 @@ where
 
     if is_tty {
         eprint!(
-            "\r\n[tether shell — Ctrl-A Q quit, Ctrl-A C config, Ctrl-A V ports, Ctrl-A ? help]\r\n\r\n"
+            "\r\n[tether shell — Ctrl-A Q quit, Ctrl-A B/D/R/L (break/dtr/rts/lines), Ctrl-A C/V (config/ports), Ctrl-A ? help]\r\n\r\n"
         );
     }
 
@@ -998,6 +1091,10 @@ where
 
     let mut next_id: i64 = 1_000_000;
     let mut escape_pending = false;
+    // Track DTR / RTS state locally so Ctrl-A D / R can toggle. Both lines
+    // are conventionally asserted on a freshly-opened port.
+    let mut dtr_on = true;
+    let mut rts_on = true;
 
     // Helper closure: send a chunk of bytes via the message channel.
     let send_bytes = |bytes: &[u8], next_id: &mut i64| -> bool {
@@ -1021,6 +1118,10 @@ where
             "\r\n[Ctrl-A Q  : quit]\r\n\
              [Ctrl-A C  : show serial config]\r\n\
              [Ctrl-A V  : list available ports]\r\n\
+             [Ctrl-A B  : send BREAK]\r\n\
+             [Ctrl-A D  : toggle DTR]\r\n\
+             [Ctrl-A R  : toggle RTS]\r\n\
+             [Ctrl-A L  : show modem status (CTS/DSR/RI/DCD)]\r\n\
              [Ctrl-A ?  : help]\r\n\
              [Ctrl-A ^A : send literal Ctrl-A]\r\n\r\n"
         );
@@ -1122,6 +1223,116 @@ where
                                 eprint!("\r\n[list_ports error: {}]\r\n", error.message);
                             }
                             None => eprint!("\r\n[list_ports: timeout]\r\n"),
+                        }
+                    }
+                    b'b' | b'B' => {
+                        if !buffer.is_empty() {
+                            let _ = send_bytes(&buffer, &mut next_id);
+                            buffer.clear();
+                        }
+                        let id = next_id; next_id += 1;
+                        let req = Request::new(
+                            RpcId::Number(id),
+                            "send_break",
+                            json!({"duration_ms": 250}),
+                        );
+                        let _ = msg_tx.send(Message::Request(req));
+                        match recv_response_for(id, &mut resp_rx, std::time::Duration::from_millis(2000)).await {
+                            Some(tether_protocol::message::ResponsePayload::Ok { .. }) => {
+                                eprint!("\r\n[break: 250ms]\r\n");
+                            }
+                            Some(tether_protocol::message::ResponsePayload::Err { error }) => {
+                                eprint!("\r\n[break error: {}]\r\n", error.message);
+                            }
+                            None => eprint!("\r\n[break: timeout]\r\n"),
+                        }
+                    }
+                    b'd' | b'D' => {
+                        if !buffer.is_empty() {
+                            let _ = send_bytes(&buffer, &mut next_id);
+                            buffer.clear();
+                        }
+                        dtr_on = !dtr_on;
+                        let id = next_id; next_id += 1;
+                        let req = Request::new(
+                            RpcId::Number(id),
+                            "set_dtr",
+                            json!({"on": dtr_on}),
+                        );
+                        let _ = msg_tx.send(Message::Request(req));
+                        match recv_response_for(id, &mut resp_rx, std::time::Duration::from_millis(2000)).await {
+                            Some(tether_protocol::message::ResponsePayload::Ok { .. }) => {
+                                eprint!(
+                                    "\r\n[DTR: {}]\r\n",
+                                    if dtr_on { "asserted" } else { "deasserted" }
+                                );
+                            }
+                            Some(tether_protocol::message::ResponsePayload::Err { error }) => {
+                                // Roll back local state — apply failed.
+                                dtr_on = !dtr_on;
+                                eprint!("\r\n[DTR error: {}]\r\n", error.message);
+                            }
+                            None => {
+                                dtr_on = !dtr_on;
+                                eprint!("\r\n[DTR: timeout]\r\n");
+                            }
+                        }
+                    }
+                    b'r' | b'R' => {
+                        if !buffer.is_empty() {
+                            let _ = send_bytes(&buffer, &mut next_id);
+                            buffer.clear();
+                        }
+                        rts_on = !rts_on;
+                        let id = next_id; next_id += 1;
+                        let req = Request::new(
+                            RpcId::Number(id),
+                            "set_rts",
+                            json!({"on": rts_on}),
+                        );
+                        let _ = msg_tx.send(Message::Request(req));
+                        match recv_response_for(id, &mut resp_rx, std::time::Duration::from_millis(2000)).await {
+                            Some(tether_protocol::message::ResponsePayload::Ok { .. }) => {
+                                eprint!(
+                                    "\r\n[RTS: {}]\r\n",
+                                    if rts_on { "asserted" } else { "deasserted" }
+                                );
+                            }
+                            Some(tether_protocol::message::ResponsePayload::Err { error }) => {
+                                rts_on = !rts_on;
+                                eprint!("\r\n[RTS error: {}]\r\n", error.message);
+                            }
+                            None => {
+                                rts_on = !rts_on;
+                                eprint!("\r\n[RTS: timeout]\r\n");
+                            }
+                        }
+                    }
+                    b'l' | b'L' => {
+                        if !buffer.is_empty() {
+                            let _ = send_bytes(&buffer, &mut next_id);
+                            buffer.clear();
+                        }
+                        let id = next_id; next_id += 1;
+                        let req = Request::new(
+                            RpcId::Number(id),
+                            "read_modem_status",
+                            json!({}),
+                        );
+                        let _ = msg_tx.send(Message::Request(req));
+                        match recv_response_for(id, &mut resp_rx, std::time::Duration::from_millis(2000)).await {
+                            Some(tether_protocol::message::ResponsePayload::Ok { result }) => {
+                                let bit = |k: &str| result.get(k).and_then(|b| b.as_bool()).unwrap_or(false);
+                                let m = |b| if b { "1" } else { "0" };
+                                eprint!(
+                                    "\r\n[lines: CTS={} DSR={} RI={} DCD={}]\r\n",
+                                    m(bit("cts")), m(bit("dsr")), m(bit("ri")), m(bit("dcd"))
+                                );
+                            }
+                            Some(tether_protocol::message::ResponsePayload::Err { error }) => {
+                                eprint!("\r\n[lines error: {}]\r\n", error.message);
+                            }
+                            None => eprint!("\r\n[lines: timeout]\r\n"),
                         }
                     }
                     other => {
@@ -1337,6 +1548,60 @@ fn print_ports(v: &Value, force_json: bool) {
             println!("{path}  ({kind})  {}", details.join(", "));
         }
     }
+}
+
+fn print_device_list(v: &Value, force_json: bool) {
+    if force_json {
+        println!("{}", serde_json::to_string_pretty(v).unwrap_or_default());
+        return;
+    }
+    let empty = Vec::<Value>::new();
+    let devices = v.get("devices").and_then(|x| x.as_array()).unwrap_or(&empty);
+    let default_id = v.get("default_device").and_then(|s| s.as_str()).unwrap_or("");
+    if devices.is_empty() {
+        eprintln!("(no devices)");
+        return;
+    }
+    for d in devices {
+        let id = d.get("id").and_then(|s| s.as_str()).unwrap_or("?");
+        let path = d.get("path").and_then(|s| s.as_str()).unwrap_or("?");
+        let baud = d.get("baud").and_then(|n| n.as_u64()).unwrap_or(0);
+        let connected = d.get("connected").and_then(|b| b.as_bool()).unwrap_or(false);
+        let exp_disc = d
+            .get("explicitly_disconnected")
+            .and_then(|b| b.as_bool())
+            .unwrap_or(false);
+        let parity = d.get("parity").and_then(|s| s.as_str()).unwrap_or("none");
+        let data_bits = d.get("data_bits").and_then(|n| n.as_u64()).unwrap_or(8);
+        let stop_bits = d.get("stop_bits").and_then(|n| n.as_u64()).unwrap_or(1);
+        let flow = d.get("flow_control").and_then(|s| s.as_str()).unwrap_or("none");
+        let parity_letter = parity.chars().next().map(|c| c.to_ascii_uppercase()).unwrap_or('?');
+        let marker = if id == default_id { " (default)" } else { "" };
+        let status = if exp_disc {
+            "disconnected (explicit)"
+        } else if connected {
+            "connected"
+        } else {
+            "disconnected"
+        };
+        println!(
+            "{:10}  {} @ {} {}{}{} flow={}  [{}]{}",
+            id, path, baud, data_bits, parity_letter, stop_bits, flow, status, marker
+        );
+    }
+}
+
+fn print_modem_status(v: &Value, force_json: bool) {
+    if force_json {
+        println!("{}", serde_json::to_string_pretty(v).unwrap_or_default());
+        return;
+    }
+    let cts = v.get("cts").and_then(|b| b.as_bool()).unwrap_or(false);
+    let dsr = v.get("dsr").and_then(|b| b.as_bool()).unwrap_or(false);
+    let ri = v.get("ri").and_then(|b| b.as_bool()).unwrap_or(false);
+    let dcd = v.get("dcd").and_then(|b| b.as_bool()).unwrap_or(false);
+    let mark = |b| if b { "1" } else { "0" };
+    println!("CTS={}  DSR={}  RI={}  DCD={}", mark(cts), mark(dsr), mark(ri), mark(dcd));
 }
 
 fn print_device_config(device: &Value, force_json: bool) {
