@@ -141,9 +141,13 @@ cargo build --workspace --release
 ## Quick start
 
 ```sh
-# Standalone — `tether` brings up its own private daemon for one device,
-# then shuts it down when you exit. Same UX as `tio /dev/ttyUSB0`:
-tether -D /dev/tty.usbserial-XXXX -b 115200      # Ctrl-A then Q to quit
+# `tio`-style one-liner — pass the device path as the first argument.
+# tether brings up its own private daemon, drops you into an interactive
+# shell, and shuts everything down on exit.
+tether /dev/tty.usbserial-XXXX                   # Ctrl-A then Q to quit
+
+# Same thing with an explicit baud:
+tether -b 9600 -D /dev/tty.usbserial-XXXX
 
 # Multi-client — start a long-lived daemon, attach as many clients as you
 # want from any terminal (or remote, with --tcp).

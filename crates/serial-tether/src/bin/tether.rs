@@ -30,7 +30,20 @@ use tether_protocol::{
 };
 
 #[derive(Parser, Debug)]
-#[command(name = "tether", version, about = "tether — non-interactive client for tetherd")]
+#[command(
+    name = "tether",
+    version,
+    about = "tether — share any serial port with humans, scripts, and AI agents",
+    long_about = "tether — share any serial port with humans, scripts, and AI agents.\n\n\
+                  QUICK START\n  \
+                  tether /dev/ttyUSB0          drop into an interactive shell (no daemon needed)\n  \
+                  tether                       attach to the default daemon at /tmp/tetherd.sock\n  \
+                  tether status                show daemon + device info\n  \
+                  tether run \"version\" \\\n    \
+                    -u \"# \" --literal --timeout-ms 3000\n\n\
+                  Pass `-D <PATH>` (or just <PATH> as the first arg) to auto-spawn a private\n\
+                  daemon, run, and tear it down on exit — `tio /dev/ttyUSB0`-style."
+)]
 struct Cli {
     /// Daemon endpoint. Either a UDS path (e.g. /tmp/tetherd.sock) or
     /// `tcp://host:port` / `tcp:host:port` for a remote daemon.
@@ -228,8 +241,42 @@ enum Cmd {
     Connect,
 }
 
+/// Tio-like quick-start sugar: if the user runs `tether /dev/ttyUSB0`
+/// (path as the first positional arg, no daemon involvement), rewrite the
+/// argv to `tether -D /dev/ttyUSB0` so the existing standalone-mode code
+/// path takes over. The goal is for a first-time user to never have to
+/// know about the daemon/client split.
+///
+/// Detection rule (intentionally narrow to avoid surprising existing
+/// users):
+///   - We look at `args[1]` only. If a user mixes leading flags with a
+///     path positional later, they should still pass `-D` explicitly.
+///   - The token must contain `/` or start with `~` to count as a path.
+///     Plain identifiers (`status`, `dtr`, `board0`, …) fall through to
+///     normal subcommand parsing.
+fn rewrite_argv_for_path_shorthand(args: &mut Vec<String>) {
+    if args.len() < 2 {
+        return;
+    }
+    let first = &args[1];
+    if first.starts_with('-') {
+        return; // user gave a flag first; don't second-guess
+    }
+    let looks_like_path = first.contains('/') || first.starts_with('~');
+    if !looks_like_path {
+        return;
+    }
+    // Don't double-up if the user somehow already passed `-D` later.
+    if args.iter().skip(2).any(|a| a == "-D" || a == "--device") {
+        return;
+    }
+    args.insert(1, "-D".to_string());
+}
+
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let mut argv: Vec<String> = std::env::args().collect();
+    rewrite_argv_for_path_shorthand(&mut argv);
+    let cli = Cli::parse_from(argv);
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
     let result = runtime.block_on(run(cli));
     match result {
@@ -473,7 +520,11 @@ fn make_uds_connect_error(path: &str, e: std::io::Error) -> CliError {
     let msg = format!(
         "tether: cannot connect to {path} — {cause}\n\
          \n\
-         Start the daemon first:\n\
+         For one-off use, just give the device path — no daemon needed:\n\
+         \n\
+         \x20\x20tether /dev/tty.usbserial-XXXX\n\
+         \n\
+         For long-lived multi-client use, start a daemon first:\n\
          \n\
          \x20\x20tetherd -D /dev/tty.usbserial-XXXX -b 115200\n\
          \n\
