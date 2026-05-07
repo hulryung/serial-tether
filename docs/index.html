@@ -7,11 +7,18 @@
 <meta name="description" content="A daemon and CLI that lets AI agents and humans share a single serial device. Race-free RPC, raw-mode shell, UDS or TCP, cross-platform.">
 <meta property="og:title" content="Serial Tether">
 <meta property="og:description" content="One serial port. One daemon. Many clients. Designed for the era when both an AI agent and a human want to drive the same dev board.">
-<meta property="og:image" content="https://github.com/hulryung/serial-tether/raw/main/assets/og.png">
+<!-- og:image must return 200 directly. github.com/.../raw/... redirects
+     to raw.githubusercontent.com and Twitterbot occasionally drops the
+     redirect, producing an empty card. Point straight at the CDN. -->
+<meta property="og:image" content="https://raw.githubusercontent.com/hulryung/serial-tether/main/assets/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
 <meta property="og:type" content="website">
 <meta property="og:url" content="https://hulryung.github.io/serial-tether/">
 <meta name="twitter:card" content="summary_large_image">
-<meta name="twitter:image" content="https://github.com/hulryung/serial-tether/raw/main/assets/og.png">
+<meta name="twitter:title" content="Serial Tether">
+<meta name="twitter:description" content="One serial port. One daemon. Many clients. Designed for the era when both an AI agent and a human want to drive the same dev board.">
+<meta name="twitter:image" content="https://raw.githubusercontent.com/hulryung/serial-tether/main/assets/og.png">
 
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/asciinema-player@3.7.1/dist/bundle/asciinema-player.css">
 
