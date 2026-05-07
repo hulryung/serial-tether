@@ -8,9 +8,41 @@ also apply.
 
 ## [Unreleased]
 
-- (Stabilization in progress — `cargo clippy --workspace` clean,
-  PTY-based integration test suite (`cargo test --test integration`),
-  protocol stability section in PROTOCOL.md.)
+(Nothing yet.)
+
+## [0.9.0] — 2026-05-07
+
+Stabilization release on the path to 1.0. No new user-facing features
+or wire-format changes; this release is about putting safety nets under
+everything that landed in 0.7 / 0.8 so the eventual 1.0 cut is just a
+version-number flip.
+
+### Added
+- **Protocol stability commitment** documented in
+  [`docs/PROTOCOL.md` §10](docs/PROTOCOL.md). Spells out exactly what
+  freezes when 1.0 is tagged: `protocol_version` "1" stays put for the
+  entire 1.x crate series, additive-only evolution rules per field
+  class, and what counts as minor vs patch vs reserved-for-2.0.
+- **End-to-end integration test suite**:
+  `crates/serial-tether/tests/integration.rs` (7 tests, ~2s, runs as
+  part of `cargo test`). Each test spawns its own `tetherd` against
+  `socat`-created PTY pair(s) and asserts on JSON output / exit codes.
+  Coverage: single-device flow, multi-device list-devices + per-device
+  baud override, ambiguous-device error (-32015), tio control on PTY
+  (-32007), disconnect/connect lifecycle, `tether <PATH>` shorthand,
+  list_ports shape stability.
+- **`CHANGELOG.md`** formalised (this file). README docs index links it.
+
+### Changed
+- `cargo clippy --workspace --all-targets` is silent. Cleared three
+  accumulated warnings:
+  - `emit_disconnect` flag in serial.rs was dead — dropped (the daemon
+    already verifies the device opens once before spawning the owner
+    task, so the suppression case it guarded can't happen).
+  - `state.devices.values().cloned()` → `.values()` (Arc clone happens
+    inside the loop body; outer `.cloned()` was redundant).
+  - `std::io::Error::new(ErrorKind::Other, ...)` →
+    `std::io::Error::other(...)`.
 
 ## [0.8.2] — 2026-05-07
 
@@ -103,7 +135,8 @@ state machine, ANSI/echo stripping, the ring-buffer fan-out, the
 `tether shell` raw-mode client, and TCP transport with token auth.
 See `git log --first-parent v0.6.0` for the full history.
 
-[Unreleased]: https://github.com/hulryung/serial-tether/compare/v0.8.2...HEAD
+[Unreleased]: https://github.com/hulryung/serial-tether/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/hulryung/serial-tether/releases/tag/v0.9.0
 [0.8.2]: https://github.com/hulryung/serial-tether/releases/tag/v0.8.2
 [0.8.1]: https://github.com/hulryung/serial-tether/releases/tag/v0.8.1
 [0.8.0]: https://github.com/hulryung/serial-tether/releases/tag/v0.8.0

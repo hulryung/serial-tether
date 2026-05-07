@@ -711,7 +711,7 @@ dependencies = [
 
 [[package]]
 name = "serial-tether"
-version = "0.8.2"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -834,7 +834,7 @@ dependencies = [
 
 [[package]]
 name = "tether-protocol"
-version = "0.8.2"
+version = "0.9.0"
 dependencies = [
  "base64",
  "bytes",

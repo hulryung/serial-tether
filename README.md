@@ -128,7 +128,7 @@ cargo install serial-tether
 
 **Pre-built binaries via curl** (no dependencies):
 ```sh
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/hulryung/serial-tether/releases/download/v0.8.2/serial-tether-installer.sh | sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/hulryung/serial-tether/releases/download/v0.9.0/serial-tether-installer.sh | sh
 ```
 
 Or **build from source**:
@@ -257,7 +257,8 @@ bash tools/smoke_test.sh
 
 ## Status
 
-Shipped through v0.8.2:
+Shipped through v0.9.0:
+- ✅ Stabilization toward 1.0: `cargo clippy --workspace` clean, 7-test PTY-based integration suite (`cargo test --test integration`), protocol stability commitment in [`docs/PROTOCOL.md` §10](docs/PROTOCOL.md), formal CHANGELOG.md (v0.9.0)
 - ✅ Tio-style quick-start: `tether /dev/ttyUSB0` drops into an interactive shell with no daemon to set up — bare path as the first arg auto-spawns a private `tetherd` (v0.8.2)
 - ✅ Multi-device daemon: one `tetherd` owns N ports, addressed by `--device <id>` (v0.8.0)
 - ✅ `list_devices` RPC + `tether list-devices` CLI (v0.8.0)
