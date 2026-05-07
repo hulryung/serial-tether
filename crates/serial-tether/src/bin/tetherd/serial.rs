@@ -418,11 +418,11 @@ pub fn spawn(
         let initial_backoff = Duration::from_millis(500);
         let max_backoff = Duration::from_secs(10);
         let mut backoff = initial_backoff;
-        // We don't broadcast a Disconnected on the *first* open failure (no
-        // one was attached yet, and the daemon refuses to start if the
-        // first open fails anyway). After we've been connected once, every
-        // transition emits an event.
-        let mut emit_disconnect = false;
+        // The Disconnected event below is unconditional now: main.rs
+        // verifies the device opens once before spawning this task, so by
+        // the time we reach the post-session `device_events.send(...)`
+        // call we've always had at least one successful open. A
+        // first-failure suppression flag was dropped in the v0.8.x cleanup.
 
         loop {
             // If the operator has explicitly disconnected this device
@@ -486,7 +486,6 @@ pub fn spawn(
                             });
                         }
                         reconnected.notify_waiters();
-                        emit_disconnect = true;
                         backoff = initial_backoff;
                         break p;
                     }
@@ -555,12 +554,10 @@ pub fn spawn(
                 s.last_disconnect_reason = Some(reason.clone());
                 s.disconnect_count += 1;
             }
-            if emit_disconnect {
-                let _ = device_events.send(DeviceEvent {
-                    kind: DeviceEventKind::Disconnected,
-                    detail: Some(reason),
-                });
-            }
+            let _ = device_events.send(DeviceEvent {
+                kind: DeviceEventKind::Disconnected,
+                detail: Some(reason),
+            });
             // Brief gap before next reopen attempt so a flapping device
             // doesn't pin a CPU.
             tokio::time::sleep(Duration::from_millis(200)).await;
@@ -600,7 +597,7 @@ fn apply_to_real(
 }
 
 fn serialport_to_io(e: tokio_serial::Error) -> std::io::Error {
-    std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
+    std::io::Error::other(e.to_string())
 }
 
 /// Persist a successful Apply into the shared config so the next reopen

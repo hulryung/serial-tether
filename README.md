@@ -11,6 +11,7 @@
 - [`docs/AI_AGENT_GUIDE.md`](docs/AI_AGENT_GUIDE.md) — **how to teach Claude Code / Codex / Cursor to use it** (paste-and-go AGENTS.md block + verification script)
 - [`docs/AGENT_USAGE.md`](docs/AGENT_USAGE.md) — one-page command cookbook the AI agent itself reads
 - [`docs/PROTOCOL.md`](docs/PROTOCOL.md) — JSON-RPC 2.0 / NDJSON wire spec (v1)
+- [`CHANGELOG.md`](CHANGELOG.md) — release-by-release notes
 - [`examples/`](examples/) — five working Bash automation scripts
 
 `tetherd` owns the serial port; multiple clients (`tether`, user scripts, the future `tether-tui`) connect over a Unix socket / Named Pipe / TCP and read and write concurrently. The agent-facing CLI (`tether`) is transactional, structured, and bounded by design: JSON-RPC responses carry decoded text, exit codes follow shell conventions, the `run` primitive is race-free at the daemon level, and output truncation guards LLM context budgets.

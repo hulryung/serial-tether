@@ -95,7 +95,7 @@ where
     // to it. Phase 6 will pull this into a tighter helper, but the current
     // shape already works for N devices.
     let mut fanout_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
-    for dev in state.devices.values().cloned() {
+    for dev in state.devices.values() {
         let fanout_state = state.clone();
         let fanout_conn = conn.clone();
         let fanout_tx = out_tx.clone();
@@ -148,7 +148,7 @@ where
     // `device` notification (PROTOCOL.md §7.5) tagged with `device_id` so
     // multi-device clients can route them.
     let mut device_event_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
-    for dev in state.devices.values().cloned() {
+    for dev in state.devices.values() {
         let mut device_rx = dev.events.subscribe();
         let device_tx = out_tx.clone();
         let dev_id = dev.id.clone();

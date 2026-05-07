@@ -469,6 +469,37 @@ If the device drops, in-flight `expect`/`run` requests fail with `-32005 device_
 - Clients must ignore unknown response fields.
 - The server ignores unknown request fields by default (a strict-validation mode is a separate option).
 
+### Stability commitment (since v1.0)
+
+The serial-tether project follows semver on the *crate* version (`serial-tether`,
+`tether-protocol` on crates.io) with the following protocol-stability rules
+layered on top. Once 1.0.0 is cut:
+
+- **`protocol_version: "1"` is frozen.** Every change shipped under a 1.x
+  crate version will be a strict superset of v1.0's wire format. v1.0
+  clients will continue to negotiate successfully against any 1.x
+  daemon, and vice versa.
+- **Method additions are minor bumps** (`1.x.0`). New methods may be
+  added; old methods keep their parameter and result schemas.
+- **Field additions are minor bumps**, with two rules:
+  1. New request fields are optional with a documented default. Servers
+     accepting v1.0 clients must continue to honor that default.
+  2. New response/notification fields are optional and clients ignore
+     them if unrecognized.
+- **Error-code additions are minor bumps.** Existing codes never change
+  meaning. Clients must not crash on an unknown code — treat as generic
+  protocol error and surface the message to the user.
+- **Patch bumps** (`1.x.y`) are reserved for bug fixes that don't change
+  the wire schema or method semantics.
+- **Breaking changes** (semantic shifts, removed fields, removed methods)
+  go in `protocol_version: "2"` under a `2.0.0` crate release. Until
+  then, anything that would force a breaking change ships as a new
+  *additive* method instead.
+
+The tested compatibility matrix is "any 1.x crate can talk to any other
+1.x crate". CI runs the integration tests on every supported MSRV bump
+within a major.
+
 ## 11. Debugging
 
 - `tetherd --log-protocol <path>`: dumps every in/out message as `{ts, dir, conn_id, raw}` NDJSON.
@@ -481,11 +512,15 @@ If the device drops, in-flight `expect`/`run` requests fail with `-32005 device_
 ## 12. Open questions (to be resolved during v1.x)
 
 - **Raw passthrough mode**: a separate connection mode where a human TUI streams keystrokes without wrapping each one in NDJSON. v0 finds plain `send` good enough; we'll add this if throughput becomes an issue.
-- **Multiple devices**: should a single daemon host more than one serial port? v1 assumes a single device. When we add more, a `device_id` field can be added (additive).
+- **Hot-add / hot-remove devices**: v0.8 settles the *static* multi-device model (all `-D` specs at startup). Dynamic add/remove via `add_device` / `remove_device` RPC is on the roadmap but not committed for v1.0.
 - **Recording / replay**: a separate tool that replays session logs preserving timing (out of protocol scope).
 - **TLS for TCP**: v0.4 ships TCP with token-based auth, plaintext on the wire. For untrusted networks, tunnel through SSH/WireGuard or wait for a future `--tls-cert/--tls-key` flag.
 - **Compression**: optional gzip framing for TCP remote mode. Not needed locally; might help on high-latency links once TLS is in place.
 
+Resolved during v0.x:
+
+- ~~**Multiple devices**: should a single daemon host more than one serial port?~~ → Yes, since v0.8.0. Each session carries a `device_id`; ambiguous calls return `-32015 ambiguous_device`.
+
 ---
 
-**Status**: v1 draft. TCP transport (§1, §6.1) shipped in v0.4.0. v1.0 will be cut after PoC feedback is folded in.
+**Status**: v1.0 draft. Multi-device + tio parity shipped in v0.8.0; tio-style quick-start in v0.8.2. Stability commitment (§10) takes effect once 1.0.0 is tagged.
