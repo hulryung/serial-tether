@@ -29,20 +29,48 @@ use tether_protocol::{
     Response, RunParams, SendParams, UntilSpec,
 };
 
+/// Trailing footer for `tether --help`. Kept brief so the long-help output
+/// still fits a single screen on most terminals; the URLs let humans (and
+/// AI agents) follow up to the canonical docs without leaving the CLI.
+const HELP_FOOTER: &str = "\
+EXAMPLES:
+    tether /dev/ttyUSB0                            tio-style standalone shell
+    tether status                                  show daemon + device info
+    tether run \"version\" -u \"# \" --literal         atomic scripted RPC
+    tether -d board0 lines                         multi-device line control
+    tether -d board0 config --baud 9600            live serial config change
+
+COMMANDS BY CATEGORY:
+    Interactive:    shell, tail, sync
+    Scripted RPCs:  send, expect, run
+    Inspection:     status, list-devices, ports, config
+    Line control:   break, dtr, rts, lines
+    Lifecycle:      reconnect, disconnect, connect
+
+LEARN MORE:
+    AI-agent setup (paste-and-go AGENTS.md / CLAUDE.md block):
+        https://github.com/hulryung/serial-tether/blob/main/docs/AI_AGENT_GUIDE.md
+    Cookbook the agent itself reads (canonical command + pitfalls):
+        https://github.com/hulryung/serial-tether/blob/main/docs/AGENT_USAGE.md
+    Wire protocol spec (JSON-RPC 2.0 / NDJSON, error codes, stability):
+        https://github.com/hulryung/serial-tether/blob/main/docs/PROTOCOL.md
+    Source / issues:
+        https://github.com/hulryung/serial-tether
+";
+
 #[derive(Parser, Debug)]
 #[command(
     name = "tether",
     version,
     about = "tether — share any serial port with humans, scripts, and AI agents",
     long_about = "tether — share any serial port with humans, scripts, and AI agents.\n\n\
-                  QUICK START\n  \
-                  tether /dev/ttyUSB0          drop into an interactive shell (no daemon needed)\n  \
-                  tether                       attach to the default daemon at /tmp/tetherd.sock\n  \
-                  tether status                show daemon + device info\n  \
-                  tether run \"version\" \\\n    \
-                    -u \"# \" --literal --timeout-ms 3000\n\n\
-                  Pass `-D <PATH>` (or just <PATH> as the first arg) to auto-spawn a private\n\
-                  daemon, run, and tear it down on exit — `tio /dev/ttyUSB0`-style."
+                  Most people never need to think about the daemon/client split:\n  \
+                  tether /dev/ttyUSB0          tio-style — auto-spawn private daemon, drop to shell\n  \
+                  tether                       attach to /tmp/tetherd.sock (long-lived daemon)\n  \
+                  tether status                inspect daemon + device(s)\n\n\
+                  Pass <PATH> as the first arg (or `-D <PATH>`) to run in standalone mode\n\
+                  for a single throwaway session.",
+    after_long_help = HELP_FOOTER
 )]
 struct Cli {
     /// Daemon endpoint. Either a UDS path (e.g. /tmp/tetherd.sock) or
@@ -50,48 +78,49 @@ struct Cli {
     ///
     /// Default: `/tmp/tetherd.sock`, or `/tmp/tetherd-<NAME>.sock` if
     /// `--name` is set.
-    #[arg(short = 's', long, global = true, conflicts_with = "name")]
+    #[arg(short = 's', long, global = true, conflicts_with = "name", help_heading = "Endpoint")]
     socket: Option<String>,
 
     /// Connect to the named daemon at `/tmp/tetherd-<NAME>.sock`.
     ///
     /// Convenience alias when `tetherd` was started with the same `--name`.
     /// Mutually exclusive with `--socket` (use `-s tcp://...` for TCP).
-    #[arg(long, global = true, value_name = "NAME")]
+    #[arg(long, global = true, value_name = "NAME", help_heading = "Endpoint")]
     name: Option<String>,
 
     /// Target device id within the daemon. Required when the daemon serves
     /// more than one device (otherwise the daemon answers `AmbiguousDevice`).
     /// Single-device daemons may omit this — it falls through to the only
     /// device. Distinct from `--name` (which selects which *daemon*).
-    #[arg(short = 'd', long, global = true, value_name = "ID")]
+    #[arg(short = 'd', long, global = true, value_name = "ID", help_heading = "Device target")]
     device_id: Option<String>,
 
     /// Emit raw JSON output instead of human-readable form.
-    #[arg(long, global = true)]
+    #[arg(long, global = true, help_heading = "Output")]
     json: bool,
 
-    /// Auth token for TCP transport (alternative to TETHER_AUTH_TOKEN env var).
-    #[arg(long, global = true, env = "TETHER_AUTH_TOKEN")]
-    auth_token: Option<String>,
-
-    /// On a `device_disconnected` reply, automatically issue `reconnect`
-    /// and retry the original RPC once. Useful for long-running scripts
-    /// that should ride out a USB hiccup. Off by default.
-    #[arg(long, global = true)]
+    /// Auto-reconnect + retry once on a `device_disconnected` reply.
+    ///
+    /// Useful for long-running scripts that should ride out a USB
+    /// hiccup. Off by default.
+    #[arg(long, global = true, help_heading = "Output")]
     auto_reconnect: bool,
+
+    /// Auth token for TCP transport (alternative to TETHER_AUTH_TOKEN env var).
+    #[arg(long, global = true, env = "TETHER_AUTH_TOKEN", help_heading = "TCP auth")]
+    auth_token: Option<String>,
 
     /// Standalone mode: also start a private `tetherd` for this device,
     /// run the requested command (or shell), then shut the daemon down
     /// when the client exits. Same UX as `tio /dev/ttyUSB0`.
     /// Cannot be combined with `-s tcp://...` or an explicit `-s` socket.
-    #[arg(short = 'D', long, global = true, value_name = "DEVICE")]
+    #[arg(short = 'D', long, global = true, value_name = "DEVICE", help_heading = "Standalone mode")]
     device: Option<String>,
 
     /// Baud rate for standalone mode (only used when `-D` is given).
     /// Not `global` so the `config` subcommand can have its own optional
     /// `--baud` flag for `set_device`.
-    #[arg(short = 'b', long, default_value_t = 115200)]
+    #[arg(short = 'b', long, default_value_t = 115200, help_heading = "Standalone mode")]
     baud: u32,
 
     /// If no subcommand is given, drops into the interactive shell.
@@ -101,6 +130,40 @@ struct Cli {
 
 #[derive(Subcommand, Debug, Clone)]
 enum Cmd {
+    // ──────── Interactive ────────
+    /// Interactive raw-mode shell (Ctrl-A Q to quit; Ctrl-A ? for help).
+    ///
+    /// Forwards stdin to the device; renders live device output to stdout.
+    /// Ctrl-A is the escape prefix:
+    ///   Ctrl-A Q      quit
+    ///   Ctrl-A C      show live serial config
+    ///   Ctrl-A V      list available serial ports
+    ///   Ctrl-A B      send BREAK pulse
+    ///   Ctrl-A D      toggle DTR
+    ///   Ctrl-A R      toggle RTS
+    ///   Ctrl-A L      show modem status (CTS / DSR / RI / DCD)
+    ///   Ctrl-A ?      help
+    ///   Ctrl-A Ctrl-A send a literal Ctrl-A to the device
+    Shell {
+        /// Replay buffer position when attaching.
+        #[arg(long, default_value = "now", value_parser = ["start", "now"])]
+        from: String,
+    },
+    /// Stream device output to stdout.
+    Tail {
+        #[arg(long, default_value = "now")]
+        from: String,
+    },
+    /// Send CR and wait until the device goes idle; print the last line as a
+    /// prompt candidate.
+    Sync {
+        #[arg(long, default_value_t = 300)]
+        idle_ms: u32,
+        #[arg(long, default_value_t = 2000)]
+        timeout_ms: u32,
+    },
+
+    // ──────── Scripted RPCs ────────
     /// Send data to the device. Does not wait for a response.
     Send {
         data: String,
@@ -147,29 +210,16 @@ enum Cmd {
         #[arg(long, default_value = "none", value_parser = ["none", "lf", "cr", "crlf"])]
         newline: String,
     },
+
+    // ──────── Inspection ────────
     /// Show daemon status.
     Status,
-    /// Stream device output to stdout.
-    Tail {
-        #[arg(long, default_value = "now")]
-        from: String,
-    },
-    /// Send CR and wait until the device goes idle; print the last line as a
-    /// prompt candidate.
-    Sync {
-        #[arg(long, default_value_t = 300)]
-        idle_ms: u32,
-        #[arg(long, default_value_t = 2000)]
-        timeout_ms: u32,
-    },
-    /// Interactive raw-mode shell. Type to send keystrokes, see live device
-    /// output. Press Ctrl-A then Q to quit, Ctrl-A then Ctrl-A to send a
-    /// literal Ctrl-A, Ctrl-A then ? for help.
-    Shell {
-        /// Replay buffer position when attaching.
-        #[arg(long, default_value = "now", value_parser = ["start", "now"])]
-        from: String,
-    },
+    /// List all devices managed by the daemon.
+    ///
+    /// AI-agent tip: pair with `--json`. Output also tells you which id is
+    /// the default (used when `--device` is omitted on single-device daemons).
+    #[command(name = "list-devices")]
+    ListDevices,
     /// List serial ports the daemon machine knows about.
     ///
     /// AI-agent tip: pass `--json` to get a stable schema. Returns an empty
@@ -198,22 +248,8 @@ enum Cmd {
         #[arg(long = "flow", value_parser = ["none", "software", "hardware"])]
         flow_control: Option<String>,
     },
-    /// Tell the daemon to drop and reopen the serial device. Useful when
-    /// the bus is wedged but the daemon thinks it's still connected.
-    Reconnect {
-        /// Don't wait for the device to come back online.
-        #[arg(long)]
-        nowait: bool,
-        /// How long to wait for the device to reopen.
-        #[arg(long, default_value_t = 5000)]
-        timeout_ms: u32,
-    },
-    /// List all devices managed by the daemon.
-    ///
-    /// AI-agent tip: pair with `--json`. Output also tells you which id is
-    /// the default (used when `--device` is omitted on single-device daemons).
-    #[command(name = "list-devices")]
-    ListDevices,
+
+    // ──────── Line control (tio-parity) ────────
     /// Send a serial BREAK pulse to the device.
     Break {
         /// Break duration. Default 250ms (matches tio).
@@ -233,11 +269,32 @@ enum Cmd {
     },
     /// Read the four input modem status lines (CTS / DSR / RI / DCD).
     Lines,
-    /// Explicitly close the serial port. The daemon stops auto-reconnecting
-    /// until `tether connect` lifts the hold.
+
+    // ──────── Lifecycle ────────
+    /// Drop and reopen the serial device (kick a wedged bus).
+    ///
+    /// The daemon closes the open port and immediately tries to reopen.
+    /// Useful when `status` shows `connected:true` but commands hang —
+    /// usually a USB driver hiccup or a half-completed board reset.
+    Reconnect {
+        /// Don't wait for the device to come back online.
+        #[arg(long)]
+        nowait: bool,
+        /// How long to wait for the device to reopen.
+        #[arg(long, default_value_t = 5000)]
+        timeout_ms: u32,
+    },
+    /// Explicitly close the port; auto-reconnect pauses until `connect`.
+    ///
+    /// Use this to hand the device temporarily to another tool (`flashrom`,
+    /// vendor flasher, etc.) without killing the daemon. The daemon
+    /// remembers the explicit-disconnect state and won't auto-reopen.
     Disconnect,
-    /// Reopen a port closed by `tether disconnect`. Has no effect if the
-    /// device wasn't explicitly disconnected.
+    /// Reopen a port closed by `tether disconnect`.
+    ///
+    /// No-op if the device wasn't explicitly disconnected. Returns the
+    /// fresh device info; pair with `--json` to see the new `connected`
+    /// flag.
     Connect,
 }
 
