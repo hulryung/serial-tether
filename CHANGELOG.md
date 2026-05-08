@@ -10,6 +10,24 @@ also apply.
 
 (Nothing yet.)
 
+## [0.9.1] — 2026-05-07
+
+### Changed
+- **`tether --help` is much easier to scan.** Subcommands reordered into
+  Interactive / Scripted RPCs / Inspection / Line control / Lifecycle
+  groups (same set, just easier to find). Global options gain
+  `help_heading` so clap renders them under Endpoint / Device target /
+  Output / TCP auth / Standalone mode sections instead of one flat list.
+  First sentences of `shell`, `reconnect`, `disconnect`, `connect`, and
+  `--auto-reconnect` trimmed so the short `-h` output stays compact.
+- New `--help` footer with EXAMPLES, COMMANDS BY CATEGORY, and a
+  LEARN MORE block of canonical doc links so AI agents calling
+  `tether --help` discover `AI_AGENT_GUIDE.md`, `AGENT_USAGE.md`, and
+  `PROTOCOL.md` without leaving the CLI.
+
+No wire-format or behavior changes — purely the CLI surface getting
+tidier on the path to 1.0.
+
 ## [0.9.0] — 2026-05-07
 
 Stabilization release on the path to 1.0. No new user-facing features
@@ -135,7 +153,8 @@ state machine, ANSI/echo stripping, the ring-buffer fan-out, the
 `tether shell` raw-mode client, and TCP transport with token auth.
 See `git log --first-parent v0.6.0` for the full history.
 
-[Unreleased]: https://github.com/hulryung/serial-tether/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/hulryung/serial-tether/compare/v0.9.1...HEAD
+[0.9.1]: https://github.com/hulryung/serial-tether/releases/tag/v0.9.1
 [0.9.0]: https://github.com/hulryung/serial-tether/releases/tag/v0.9.0
 [0.8.2]: https://github.com/hulryung/serial-tether/releases/tag/v0.8.2
 [0.8.1]: https://github.com/hulryung/serial-tether/releases/tag/v0.8.1
