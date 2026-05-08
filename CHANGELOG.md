@@ -10,6 +10,28 @@ also apply.
 
 (Nothing yet.)
 
+## [0.9.2] — 2026-05-09
+
+### Changed
+- **`tether -D <PATH>` (and the bare-path shorthand) auto-redirects to
+  an existing daemon.** Before this release, invoking standalone mode
+  while a long-lived `tetherd` was already managing the device would
+  spawn a second daemon — both processes then fought for the port,
+  garbling whatever interactive shell the operator had open. The CLI
+  now probes `/tmp/tetherd*.sock` first, finds the daemon already
+  managing the requested OS path, and attaches as a client to that
+  daemon (printing a one-line `attaching as a client — no new daemon
+  spawned` notice on stderr). Multi-device daemons additionally get
+  the matching `device_id` filled in automatically, so subsequent
+  commands route correctly.
+
+### Added
+- Integration test `standalone_redirects_to_existing_daemon` exercises
+  the redirect end-to-end against a real socat PTY pair.
+- AGENT_USAGE.md gains a "Connecting when a daemon may already be
+  running" section; AI_AGENT_GUIDE.md picks up matching guidance under
+  Don'ts / failure modes so the AI can interpret the redirect notice.
+
 ## [0.9.1] — 2026-05-07
 
 ### Changed
@@ -153,7 +175,8 @@ state machine, ANSI/echo stripping, the ring-buffer fan-out, the
 `tether shell` raw-mode client, and TCP transport with token auth.
 See `git log --first-parent v0.6.0` for the full history.
 
-[Unreleased]: https://github.com/hulryung/serial-tether/compare/v0.9.1...HEAD
+[Unreleased]: https://github.com/hulryung/serial-tether/compare/v0.9.2...HEAD
+[0.9.2]: https://github.com/hulryung/serial-tether/releases/tag/v0.9.2
 [0.9.1]: https://github.com/hulryung/serial-tether/releases/tag/v0.9.1
 [0.9.0]: https://github.com/hulryung/serial-tether/releases/tag/v0.9.0
 [0.8.2]: https://github.com/hulryung/serial-tether/releases/tag/v0.8.2

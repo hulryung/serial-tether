@@ -411,6 +411,28 @@ async fn run(mut cli: Cli) -> Result<(), CliError> {
     };
     cli.socket = Some(resolved);
 
+    // If the user (or AI agent) asked for standalone mode but a daemon is
+    // already managing this exact device path, attach to that daemon as a
+    // client instead of spawning a new one. Avoids the "two processes both
+    // open /dev/ttyUSB0" failure where the existing user's session gets
+    // garbled or kicked.
+    if let Some(device) = cli.device.as_deref() {
+        if let Some(found) = find_daemon_managing_device(device).await {
+            eprintln!(
+                "tether: device {device} is already managed by daemon at {} (id: {})",
+                found.socket, found.device_id
+            );
+            eprintln!(
+                "tether: attaching as a client — no new daemon spawned, the existing session keeps running."
+            );
+            cli.socket = Some(found.socket);
+            if cli.device_id.is_none() {
+                cli.device_id = Some(found.device_id);
+            }
+            cli.device = None;
+        }
+    }
+
     // Standalone mode: spawn our own tetherd, then continue as a normal
     // client against its ephemeral UDS. The guard kills the child when
     // we exit, regardless of how (clean exit, error, panic).
@@ -442,6 +464,127 @@ async fn run(mut cli: Cli) -> Result<(), CliError> {
             run_with_stream(framed, cli).await
         }
     }
+}
+
+/// Result of `find_daemon_managing_device`: the socket of an existing
+/// daemon plus the daemon-side device id matching the requested OS path.
+#[derive(Debug)]
+struct ExistingDaemon {
+    socket: String,
+    device_id: String,
+}
+
+/// Scan local UDS sockets and return the daemon that already manages the
+/// given OS device path, if any. Used to short-circuit standalone-mode
+/// (`-D <PATH>`) when a long-lived `tetherd` is already running for that
+/// device — spawning a second daemon there would have both processes
+/// fighting for the port, garbling the existing user's session.
+///
+/// Implementation:
+///   - Glob `/tmp/tetherd*.sock`.
+///   - Probe each in parallel: `hello` then `list_devices`, ≤300ms each.
+///   - Match by exact `device.path` string. Stale sockets / dead daemons
+///     just time out and get skipped.
+///
+/// TCP daemons are out of scope on purpose — they require an explicit
+/// `-s tcp://...`, the user / agent isn't going to surprise themselves
+/// with one.
+async fn find_daemon_managing_device(target: &str) -> Option<ExistingDaemon> {
+    use futures::future::join_all;
+
+    let entries = match std::fs::read_dir("/tmp") {
+        Ok(e) => e,
+        Err(_) => return None,
+    };
+    let candidates: Vec<std::path::PathBuf> = entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            let name = p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("");
+            name.starts_with("tetherd") && name.ends_with(".sock")
+        })
+        .collect();
+
+    if candidates.is_empty() {
+        return None;
+    }
+
+    let probes = candidates.into_iter().map(|sock_path| {
+        let target = target.to_string();
+        async move {
+            tokio::time::timeout(
+                std::time::Duration::from_millis(300),
+                probe_daemon_devices(sock_path.clone(), &target),
+            )
+            .await
+            .ok()
+            .flatten()
+        }
+    });
+
+    for hit in join_all(probes).await.into_iter().flatten() {
+        return Some(hit);
+    }
+    None
+}
+
+/// Open one UDS socket, send `hello` + `list_devices`, return a hit if
+/// any device's path matches `target`.
+async fn probe_daemon_devices(
+    sock_path: std::path::PathBuf,
+    target: &str,
+) -> Option<ExistingDaemon> {
+    let stream = UnixStream::connect(&sock_path).await.ok()?;
+    let mut framed = Framed::new(stream, NdjsonCodec::new());
+
+    // hello (auth_token=None — UDS is OS-authenticated)
+    let hello = Request::new(
+        RpcId::Number(1),
+        "hello",
+        serde_json::to_value(HelloParams {
+            protocol_version: tether_protocol::PROTOCOL_VERSION.to_string(),
+            client: tether_protocol::ClientInfo {
+                name: "tether-probe".into(),
+                version: env!("CARGO_PKG_VERSION").into(),
+                kind: "agent".into(),
+            },
+            auth_token: None,
+        })
+        .ok()?,
+    );
+    framed.send(Message::Request(hello)).await.ok()?;
+    // Drain hello response (we don't care about its content).
+    let _ = framed.next().await;
+
+    // list_devices
+    let list = Request::new(RpcId::Number(2), "list_devices", json!({}));
+    framed.send(Message::Request(list)).await.ok()?;
+    let resp = match framed.next().await? {
+        Ok(Message::Response(r)) => r,
+        _ => return None,
+    };
+    let result = match resp.payload {
+        ResponsePayload::Ok { result } => result,
+        _ => return None,
+    };
+    let devices = result.get("devices")?.as_array()?;
+    for d in devices {
+        let path = d.get("path").and_then(|s| s.as_str()).unwrap_or("");
+        if path == target {
+            let id = d.get("id").and_then(|s| s.as_str()).unwrap_or("").to_string();
+            if id.is_empty() {
+                return None; // shouldn't happen in v0.8+, but defensive
+            }
+            return Some(ExistingDaemon {
+                socket: sock_path.to_string_lossy().to_string(),
+                device_id: id,
+            });
+        }
+    }
+    None
 }
 
 /// RAII guard that owns the spawned daemon child. On drop, sends SIGTERM

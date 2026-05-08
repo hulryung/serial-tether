@@ -360,6 +360,57 @@ fn path_shorthand_no_dash_d_required() {
 }
 
 #[test]
+fn standalone_redirects_to_existing_daemon() {
+    // Simulates the AI-agent footgun: a long-lived `tetherd` is already
+    // managing a device, then someone invokes `tether -D <PATH>` (or the
+    // bare-path shorthand). Without auto-redirect, two daemons would race
+    // for the port. With auto-redirect we expect the second invocation to
+    // attach to the existing daemon as a client and pick up the right
+    // device_id automatically.
+    let pty = spawn_pty();
+    let d = spawn_daemon(&[format!("board0={}", pty.path)]);
+
+    let output = Command::new(TETHER)
+        .arg("-D")
+        .arg(&pty.path)
+        .arg("status")
+        .arg("--json")
+        .output()
+        .expect("run tether -D <PATH> status");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        output.status.success(),
+        "tether -D <existing> status failed:\nstderr:\n{stderr}"
+    );
+
+    // The friendly redirect message landed.
+    assert!(
+        stderr.contains("already managed") && stderr.contains("attaching as a client"),
+        "expected redirect message, got stderr:\n{stderr}"
+    );
+
+    // It actually connected to OUR daemon (board0 in id), not a freshly
+    // spawned one (which would have used the basename `ttysNNN` instead).
+    let v: serde_json::Value =
+        serde_json::from_str(&stdout).expect("status output is valid JSON");
+    assert_eq!(
+        v.get("default_device").and_then(|s| s.as_str()),
+        Some("board0"),
+        "should have routed to existing daemon (default_device=board0), got: {v}"
+    );
+
+    // Sanity: the existing daemon is still alive and reachable directly.
+    let v2 = tether_json(&d, &["status"]);
+    assert_eq!(
+        v2.get("default_device").and_then(|s| s.as_str()),
+        Some("board0")
+    );
+}
+
+#[test]
 fn ports_handler_returns_array() {
     // `tether ports` calls the daemon's list_ports RPC. Smoke-check it
     // returns an array (may be empty in restricted environments — both

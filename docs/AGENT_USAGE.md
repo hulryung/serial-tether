@@ -142,6 +142,38 @@ Don't guess the prompt. Boards differ. `sync` is cheap.
   concurrent reads (tail), do `tether tail` in one connection and `tether run`
   in another. Don't try to send commands from two parallel `run`s racing.
 
+## Connecting when a daemon may already be running
+
+If a human user (or a previous agent run) has a `tether shell` open against
+the device, **do not invoke `tether -D <PATH>` blindly**. Two daemons fighting
+for the same `/dev/ttyUSB0` will scramble the existing user's session.
+
+The CLI auto-detects this since v0.9.2: any `tether -D <PATH>` (or bare-path
+shorthand) probes `/tmp/tetherd*.sock` first, and if an existing daemon owns
+that path it attaches as a client to that daemon instead — printing a
+short "attaching as a client" notice on stderr. The existing session keeps
+running undisturbed.
+
+You can also check explicitly before doing anything destructive:
+
+```sh
+# 1. Is anyone home? (returns -32xxx with a clear message if not)
+tether --json status
+
+# 2. List daemons / devices reachable from the default socket.
+tether --json list-devices
+
+# If either succeeds → a daemon is running, just attach as a client:
+tether --json run "<cmd>" -u "<prompt>" --literal --timeout-ms 5000
+
+# If both fail with -32003 connection error → no daemon, fine to spawn:
+tether -D /dev/ttyUSB0 --json run "..." -u "..." ...
+```
+
+Treat `tether -D` (and the `tether <PATH>` shorthand) as "lazy spawn —
+will reuse an existing daemon if one already manages this device." You
+do not need a separate `pgrep tetherd` check.
+
 ## Detecting what kind of device you're talking to
 
 ```sh

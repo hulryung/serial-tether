@@ -128,7 +128,7 @@ cargo install serial-tether
 
 **Pre-built binaries via curl** (no dependencies):
 ```sh
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/hulryung/serial-tether/releases/download/v0.9.1/serial-tether-installer.sh | sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/hulryung/serial-tether/releases/download/v0.9.2/serial-tether-installer.sh | sh
 ```
 
 Or **build from source**:

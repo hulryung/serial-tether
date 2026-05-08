@@ -89,6 +89,11 @@ fired.
 - Don't compose `send` + `expect` yourself; `run` is atomic.
 - Don't drop `--timeout-ms`; default is 3 s and will silently truncate
   long-running commands.
+- Don't blindly invoke `tether -D <PATH>` (or the bare-path shorthand)
+  if a daemon may already be running for that device — it'll auto-route
+  to the existing daemon, but the CLI's stderr notice ("attaching as a
+  client") is your cue to drop `-D` from subsequent calls and just use
+  `tether <subcommand>` / `tether -d <id> <subcommand>`.
 
 **Cookbook & exit-code reference:**
 https://github.com/hulryung/serial-tether/blob/main/docs/AGENT_USAGE.md
@@ -156,9 +161,17 @@ blindly:
 - **Garbled bytes / random characters** — wrong baud. The agent should
   call `tether config` to read live, then `tether config --baud <N>` if it
   has authorization to change.
+- **stderr says "attaching as a client — no new daemon spawned"** — not
+  an error, but a signal: a daemon was already running for this device,
+  so the agent's `tether -D <PATH>` got auto-redirected to it. From this
+  point on the agent should drop `-D` and just use `tether <subcommand>`
+  (or `tether -d <id> <subcommand>` if the daemon is multi-device — the
+  redirect already populated the right id). Don't try to "kill" the
+  existing daemon; the user's interactive session is on it.
 
 For a longer treatment, the agent should read [AGENT_USAGE.md §Common
-pitfalls](AGENT_USAGE.md#common-pitfalls).
+pitfalls](AGENT_USAGE.md#common-pitfalls) and [§Connecting when a daemon
+may already be running](AGENT_USAGE.md#connecting-when-a-daemon-may-already-be-running).
 
 ---
 
