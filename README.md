@@ -186,6 +186,14 @@ UDS connections are authenticated by the OS (file permissions); TCP
 connections always require a token. Run with both `-s /tmp/tetherd.sock` and
 `--tcp ...` to expose the daemon on both transports simultaneously.
 
+> **Note:** the `tether <PATH>` (and `tether -D <PATH>`) shorthand does
+> *not* take `--tcp`. Standalone mode spawns an ephemeral daemon that
+> dies when the client exits — exposing TCP from a short-lived process
+> only to have it disappear minutes later surprises remote clients.
+> For TCP, start `tetherd` explicitly (the snippet above). This is the
+> intentional split between "throwaway session for me" (`tether <PATH>`)
+> and "shared service" (`tetherd -D <PATH> --tcp`).
+
 ### More than one board
 
 There are two ways to run several boards. Pick whichever suits the setup.
