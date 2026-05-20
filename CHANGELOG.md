@@ -10,6 +10,43 @@ also apply.
 
 (Nothing yet.)
 
+## [0.9.3] — 2026-05-20
+
+### Added
+- **`tether <PATH> --tcp` — one-liner shell + TCP exposure.** While the
+  client is in standalone mode (a path positional or `-D <PATH>`), it
+  now also forwards `--tcp [<HOST:PORT>]` and `--auth-token <TOKEN>` to
+  the embedded daemon. Use `--tcp=HOST:PORT` for an explicit bind
+  (equals is required so a bare `--tcp` followed by a subcommand like
+  `status` isn't mis-parsed as the value). Before the shell starts,
+  stderr prints the listener address, the token (auto-generated if
+  omitted), and the `tether -s tcp://… --auth-token …` snippet a
+  remote agent should use. The TCP listener follows the embedded
+  daemon's ephemeral lifespan — quit the shell, the daemon stops, and
+  remote clients see their connection drop.
+- New integration test
+  `standalone_with_tcp_exposes_remote_attachable_listener`: spawns
+  `tether <PTY> --tcp=… --auth-token …`, then verifies a separate
+  `tether -s tcp://…` client can attach to the same embedded daemon.
+
+### Changed
+- **`tetherd --help` is grouped + has a doc-link footer**, matching the
+  `tether --help` polish from v0.9.1. Options are bucketed into
+  `Device(s)` / `Serial defaults` / `Listeners` / `TCP auth` / `Buffer`;
+  the footer prints `EXAMPLES`, the full `-D` spec grammar, and
+  `LEARN MORE` links to `AGENT_USAGE.md` / `PROTOCOL.md` / repo URL.
+- **Fan-out drain loop no longer sleeps with un-emitted data buffered.**
+  `conn.rs` now drains every session before re-entering `buffer.wait()`,
+  closing a small race window where `RingBuffer::push`'s
+  `notify_waiters()` could be lost while a fan-out task was mid-encode.
+  Wire format unchanged; no user-facing behavior change for normal
+  workloads (the burst-y "plays then pauses" cadence operators have
+  reported turned out to be FTDI USB IN polling + board-side
+  kernel-printk spooling, not the daemon).
+- README "Remote daemon (TCP)" gains a "Quick share from a standalone
+  session" subsection documenting the new one-liner; the prior
+  "intentional split" note has been retracted accordingly.
+
 ## [0.9.2] — 2026-05-09
 
 ### Changed
@@ -175,7 +212,8 @@ state machine, ANSI/echo stripping, the ring-buffer fan-out, the
 `tether shell` raw-mode client, and TCP transport with token auth.
 See `git log --first-parent v0.6.0` for the full history.
 
-[Unreleased]: https://github.com/hulryung/serial-tether/compare/v0.9.2...HEAD
+[Unreleased]: https://github.com/hulryung/serial-tether/compare/v0.9.3...HEAD
+[0.9.3]: https://github.com/hulryung/serial-tether/releases/tag/v0.9.3
 [0.9.2]: https://github.com/hulryung/serial-tether/releases/tag/v0.9.2
 [0.9.1]: https://github.com/hulryung/serial-tether/releases/tag/v0.9.1
 [0.9.0]: https://github.com/hulryung/serial-tether/releases/tag/v0.9.0

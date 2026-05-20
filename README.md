@@ -128,7 +128,7 @@ cargo install serial-tether
 
 **Pre-built binaries via curl** (no dependencies):
 ```sh
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/hulryung/serial-tether/releases/download/v0.9.2/serial-tether-installer.sh | sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/hulryung/serial-tether/releases/download/v0.9.3/serial-tether-installer.sh | sh
 ```
 
 Or **build from source**:
@@ -186,13 +186,36 @@ UDS connections are authenticated by the OS (file permissions); TCP
 connections always require a token. Run with both `-s /tmp/tetherd.sock` and
 `--tcp ...` to expose the daemon on both transports simultaneously.
 
-> **Note:** the `tether <PATH>` (and `tether -D <PATH>`) shorthand does
-> *not* take `--tcp`. Standalone mode spawns an ephemeral daemon that
-> dies when the client exits — exposing TCP from a short-lived process
-> only to have it disappear minutes later surprises remote clients.
-> For TCP, start `tetherd` explicitly (the snippet above). This is the
-> intentional split between "throwaway session for me" (`tether <PATH>`)
-> and "shared service" (`tetherd -D <PATH> --tcp`).
+#### Quick share from a standalone session
+
+If you just want to open a shell on your Mac and let an AI agent (or a
+colleague) attach over TCP for the duration of that session, the client
+itself can spin up an embedded daemon with a TCP listener — no separate
+`tetherd` step:
+
+```sh
+# On the Mac (or wherever the USB serial is)
+tether /dev/tty.usbserial-XXXX --tcp                  # bare --tcp = 0.0.0.0:5557
+tether /dev/tty.usbserial-XXXX --tcp --auth-token MYSECRET
+tether /dev/tty.usbserial-XXXX --tcp=127.0.0.1:6666   # custom bind needs =
+```
+
+Before the shell drops in, stderr prints the listener + auto-generated
+token so any remote agent can attach:
+
+```
+tether: also listening on tcp://0.0.0.0:5557
+tether:   auth token: a3f9...d2c4
+tether:   remote clients:
+tether:     TETHER_AUTH_TOKEN=a3f9...d2c4 \
+tether:       tether -s tcp://<this-host>:5557 status
+tether:   (this daemon shuts down when you quit — Ctrl-A Q)
+```
+
+The TCP listener is bound to the **ephemeral daemon's lifespan**: when
+you exit the shell, the daemon stops and any remote clients see their
+connection drop. For a long-lived shared service that survives your
+session ending, run `tetherd -D /dev/ttyUSB0 --tcp` explicitly.
 
 ### More than one board
 

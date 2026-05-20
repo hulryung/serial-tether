@@ -411,6 +411,97 @@ fn standalone_redirects_to_existing_daemon() {
 }
 
 #[test]
+fn standalone_with_tcp_exposes_remote_attachable_listener() {
+    // `tether <PATH> --tcp=127.0.0.1:<port> --auth-token <token> status`
+    // should: spawn an embedded daemon, bind the TCP listener, succeed the
+    // status RPC, and print the listener info on stderr so a remote
+    // attacher can find it. We also verify a separate `tether -s
+    // tcp://...` client can attach to the same daemon while it's running.
+    let pty = spawn_pty();
+    // Pick a port unlikely to collide with whatever else is running.
+    let port: u16 = 5559 + (std::process::id() % 100) as u16;
+    let bind = format!("127.0.0.1:{port}");
+    let token = "it-token";
+
+    // Run a longer-living client (`tail` blocks reading the buffer) so
+    // the embedded daemon stays up while we attach from a second client.
+    let mut tail = Command::new(TETHER)
+        .arg(&pty.path)
+        .arg(format!("--tcp={bind}"))
+        .arg("--auth-token").arg(token)
+        .arg("tail")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn tether --tcp tail");
+
+    // The embedded daemon has to spawn, open the PTY, bind the UDS,
+    // bind TCP, accept hello + status. CI under load can take >800ms.
+    // Poll-and-retry instead of a fixed sleep so the test stays fast
+    // when the host is idle and tolerant when it's not.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut out = None;
+    while Instant::now() < deadline {
+        let attempt = Command::new(TETHER)
+            .arg("-s").arg(format!("tcp://{bind}"))
+            .arg("--auth-token").arg(token)
+            .arg("status")
+            .arg("--json")
+            .output()
+            .expect("run remote-style status");
+        if attempt.status.success() {
+            out = Some(attempt);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let out = out.unwrap_or_else(|| {
+        panic!("remote-style status never succeeded within 5s — TCP listener didn't come up");
+    });
+
+    // Tear down. We have to clean up both the shell client (`tail`) and
+    // its grandchild `tetherd` (the embedded daemon). Rust default
+    // signal handling means a SIGTERM to `tether` just terminates the
+    // process without unwinding — `DaemonGuard::drop` never runs and the
+    // grandchild leaks, polluting later test runs.
+    //
+    // Strategy:
+    //   1. SIGKILL the client. We don't care if it unwinds; we'll reap
+    //      the grandchild ourselves below.
+    //   2. Find any `tetherd` process tagged with our PTY path and
+    //      SIGTERM it directly (matching by `-D <pty.path>` is unique
+    //      to this test instance — socat hands out fresh /dev/ttysNNN
+    //      per spawn).
+    let _ = tail.kill();
+    let _ = tail.wait();
+
+    let _ = Command::new("pkill")
+        .args(["-TERM", "-f", &format!("tetherd -D {}", pty.path)])
+        .status();
+    // Brief grace period for the daemon to honor SIGTERM and unlink its
+    // UDS socket. Followed by SIGKILL as a paranoid backstop.
+    std::thread::sleep(Duration::from_millis(300));
+    let _ = Command::new("pkill")
+        .args(["-KILL", "-f", &format!("tetherd -D {}", pty.path)])
+        .status();
+
+    assert!(
+        out.status.success(),
+        "remote-style status failed:\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout))
+            .expect("status JSON parses");
+    assert_eq!(
+        v["device"]["path"].as_str(),
+        Some(pty.path.as_str()),
+        "remote client should see the embedded daemon's device"
+    );
+    assert_eq!(v["device"]["connected"].as_bool(), Some(true));
+}
+
+#[test]
 fn ports_handler_returns_array() {
     // `tether ports` calls the daemon's list_ports RPC. Smoke-check it
     // returns an array (may be empty in restricted environments — both

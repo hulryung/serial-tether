@@ -123,6 +123,28 @@ struct Cli {
     #[arg(short = 'b', long, default_value_t = 115200, help_heading = "Standalone mode")]
     baud: u32,
 
+    /// Also expose the embedded daemon over TCP while you're in standalone mode.
+    ///
+    /// Lets a remote client (e.g. an AI agent in a Lima VM) attach to the
+    /// same device for the duration of your local session. Bare `--tcp`
+    /// listens on 0.0.0.0:5557; for a custom bind use the equals form:
+    /// `--tcp=127.0.0.1:5557` (the equals is required so `--tcp` followed
+    /// by a subcommand name like `status` isn't mis-parsed as the value).
+    /// Has no effect without `-D` (or the bare-path shorthand).
+    /// Auth token: pass `--auth-token`, or one is auto-generated and printed
+    /// on stderr before the shell starts. **The TCP listener dies when you
+    /// quit** — remote clients see their connection drop.
+    #[arg(
+        long,
+        global = true,
+        value_name = "HOST:PORT",
+        num_args = 0..=1,
+        default_missing_value = "0.0.0.0:5557",
+        require_equals = true,
+        help_heading = "Standalone mode"
+    )]
+    tcp: Option<String>,
+
     /// If no subcommand is given, drops into the interactive shell.
     #[command(subcommand)]
     cmd: Option<Cmd>,
@@ -662,10 +684,30 @@ async fn spawn_embedded_daemon(
         CliError::Connection(format!("tether: dup log fd: {e}"))
     })?;
 
-    let child = Command::new(&tetherd)
-        .arg("-D").arg(device)
+    // If the operator requested `--tcp`, also expose the embedded daemon
+    // over the network so a remote client (e.g. an AI agent in a VM) can
+    // attach for the lifetime of this standalone session. We materialise
+    // the auth token here so both the spawned daemon and this very client
+    // process can find each other, and so we can print it to stderr before
+    // dropping into the shell.
+    let mut cmd = Command::new(&tetherd);
+    cmd.arg("-D").arg(device)
         .arg("-b").arg(baud.to_string())
-        .arg("-s").arg(&sock_path)
+        .arg("-s").arg(&sock_path);
+
+    let mut tcp_banner: Option<(String, String)> = None; // (bind, token)
+    if let Some(tcp_bind) = cli.tcp.clone() {
+        let token = cli
+            .auth_token
+            .clone()
+            .unwrap_or_else(random_token_hex);
+        cmd.arg("--tcp").arg(&tcp_bind)
+            .arg("--auth-token").arg(&token);
+        cli.auth_token = Some(token.clone());
+        tcp_banner = Some((tcp_bind, token));
+    }
+
+    let child = cmd
         .stdout(Stdio::from(log_file))
         .stderr(Stdio::from(log_for_err))
         .spawn()
@@ -689,6 +731,19 @@ async fn spawn_embedded_daemon(
         if sock_path.exists() {
             // Override the socket the rest of the client logic will dial.
             cli.socket = Some(sock_path.to_string_lossy().into_owned());
+            // Surface the TCP listener info to the user *before* the shell
+            // takes over the terminal. Remote attachers need the token and
+            // an endpoint they can reach.
+            if let Some((bind, token)) = &tcp_banner {
+                eprintln!();
+                eprintln!("tether: also listening on tcp://{bind}");
+                eprintln!("tether:   auth token: {token}");
+                eprintln!("tether:   remote clients:");
+                eprintln!("tether:     TETHER_AUTH_TOKEN={token} \\");
+                eprintln!("tether:       tether -s tcp://<this-host>:{} status", port_of(bind));
+                eprintln!("tether:   (this daemon shuts down when you quit — Ctrl-A Q)");
+                eprintln!();
+            }
             return Ok(guard);
         }
         // Did the child exit early?
@@ -706,6 +761,21 @@ async fn spawn_embedded_daemon(
     Err(CliError::Connection(format!(
         "tether: embedded tetherd did not bind {sock_path:?} within 5s"
     )))
+}
+
+/// 32-hex random token, matches the format `tetherd` itself uses when it
+/// auto-generates a token. Pulled into a helper so the spawned daemon and
+/// this client agree without round-tripping through the banner log.
+fn random_token_hex() -> String {
+    use uuid::Uuid;
+    Uuid::new_v4().simple().to_string()
+}
+
+
+/// Extract the `PORT` from `HOST:PORT`; falls back to the whole string if
+/// no `:` (shouldn't happen with our default-missing-value, but defensive).
+fn port_of(bind: &str) -> &str {
+    bind.rsplit_once(':').map(|(_, p)| p).unwrap_or(bind)
 }
 
 /// Build a friendly multi-line error when the local Unix socket can't be

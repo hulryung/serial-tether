@@ -94,6 +94,13 @@ where
     // buffer and emits `data` / `lag` notifications for any session bound
     // to it. Phase 6 will pull this into a tighter helper, but the current
     // shape already works for N devices.
+    //
+    // Cadence: we always try to drain the buffer first, then only `wait`
+    // when there's nothing to emit. This sidesteps a notify-race where
+    // `notify_waiters()` from `RingBuffer::push` is lost while this task
+    // is mid-emit — without it, fast bursts of serial data become a
+    // sawtooth ("plays then pauses then plays") because we'd sleep on
+    // wait() with un-emitted data already buffered.
     let mut fanout_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     for dev in state.devices.values() {
         let fanout_state = state.clone();
@@ -102,7 +109,7 @@ where
         let dev = dev.clone();
         fanout_tasks.push(tokio::spawn(async move {
             loop {
-                dev.buffer.wait().await;
+                let mut emitted_anything = false;
                 for sid in fanout_conn.session_ids() {
                     let Some(session) = fanout_state.sessions.get(&sid) else { continue };
                     // Skip sessions bound to a different device.
@@ -123,6 +130,7 @@ where
                             })
                             .unwrap(),
                         )));
+                        emitted_anything = true;
                     }
                     if !chunk.is_empty() {
                         let seq_start = new_cursor - chunk.len() as u64;
@@ -138,7 +146,15 @@ where
                             .unwrap(),
                         )));
                         session.lock().notify_cursor = new_cursor;
+                        emitted_anything = true;
                     }
+                }
+                // Only sleep on `wait()` when no session had pending data.
+                // If any session emitted, immediately loop again to pick up
+                // bytes that arrived while we were encoding/sending — those
+                // arrivals' `notify_waiters()` would have been a no-op.
+                if !emitted_anything {
+                    dev.buffer.wait().await;
                 }
             }
         }));

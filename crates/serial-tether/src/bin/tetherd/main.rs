@@ -21,85 +21,136 @@ use crate::serial::{
 use crate::session::SessionManager;
 use crate::state::DaemonState;
 
+/// Trailing footer for `tetherd --help`. Pattern matches `tether --help`:
+/// EXAMPLES + LEARN MORE with absolute doc URLs so an operator (or AI
+/// agent reading the help text) can follow up without leaving the CLI.
+const HELP_FOOTER: &str = "\
+EXAMPLES:
+    tetherd -D /dev/ttyUSB0                      single device, defaults
+    tetherd -D /dev/ttyUSB0 --tcp                expose on tcp://0.0.0.0:5557
+    tetherd -D /dev/ttyUSB0 --name board0        UDS at /tmp/tetherd-board0.sock
+    tetherd \\
+      -D 'board0=/dev/ttyUSB0' \\
+      -D 'board1=/dev/ttyUSB1,baud=921600,parity=odd'
+                                                 one daemon, two boards
+
+-D SPEC FORMS (each `-D` flag):
+    /dev/ttyUSB0                                 bare path, id from basename
+    board0=/dev/ttyUSB0                          explicit id (recommended)
+    board0=/dev/ttyUSB0,baud=921600,parity=odd   per-device inline overrides
+
+    Accepted inline keys: baud, data-bits, parity, stop-bits, flow.
+    Anything omitted falls back to the global `--baud` / `--parity` / etc.
+
+LEARN MORE:
+    Operator + agent docs:
+        https://github.com/hulryung/serial-tether/blob/main/docs/AGENT_USAGE.md
+    Wire protocol spec (JSON-RPC 2.0 / NDJSON, error codes, stability):
+        https://github.com/hulryung/serial-tether/blob/main/docs/PROTOCOL.md
+    Source / issues:
+        https://github.com/hulryung/serial-tether
+";
+
 #[derive(Debug, Parser)]
-#[command(name = "tetherd", version, about = "tetherd — serial port daemon")]
+#[command(
+    name = "tetherd",
+    version,
+    about = "tetherd — serial port daemon (multiplexes one device across many clients)",
+    long_about = "tetherd — serial port daemon. Owns one or more serial ports and lets\n\
+                  multiple clients (humans, scripts, AI agents) attach concurrently.\n\n\
+                  Most setups need just one flag:\n  \
+                  tetherd -D /dev/ttyUSB0                       single device, UDS only\n  \
+                  tetherd -D /dev/ttyUSB0 --tcp                 expose over TCP too\n  \
+                  tetherd -D 'board0=/dev/ttyUSB0' \\\n    \
+                          -D 'board1=/dev/ttyUSB1,baud=9600'  multi-device, per-device baud\n\n\
+                  Clients attach with `tether` (same package). See `tether --help`\n\
+                  for the client surface.",
+    after_long_help = HELP_FOOTER
+)]
 struct Args {
-    /// Serial device(s) to manage. Repeatable for multi-device daemons.
+    /// Serial device(s) to manage; repeatable. Form: `[ID=]PATH[,KEY=VAL,...]`.
     ///
-    /// Accepted forms (each `-D` flag):
+    /// Long form / examples:
     ///
-    ///   `-D /dev/ttyUSB0`
-    ///       Bare path. The device id is derived from the basename
-    ///       (stripping `tty.` / `cu.` prefixes — e.g. `ttyUSB0`).
+    ///   `-D /dev/ttyUSB0` — bare path; the device id is derived from the
+    ///   basename (stripping `tty.` / `cu.` prefixes — e.g. `ttyUSB0`).
     ///
-    ///   `-D board0=/dev/ttyUSB0`
-    ///       Explicit id (`board0`). Recommended when running >1 board so
-    ///       clients address them by friendly name.
+    ///   `-D board0=/dev/ttyUSB0` — explicit id, recommended when running
+    ///   >1 board so clients address them by friendly name.
     ///
     ///   `-D board0=/dev/ttyUSB0,baud=921600,parity=odd,data-bits=8,stop-bits=1,flow=none`
-    ///       Per-device serial settings. Any setting omitted falls back
-    ///       to the global `--baud` / `--parity` / etc. flag.
-    #[arg(short = 'D', long = "device", value_name = "[ID=]PATH[,KEY=VAL...]", required = true)]
+    ///   — per-device inline settings. Any setting omitted falls back to
+    ///   the matching global flag (`--baud`, `--parity`, …).
+    #[arg(
+        short = 'D',
+        long = "device",
+        value_name = "[ID=]PATH[,KEY=VAL...]",
+        required = true,
+        help_heading = "Device(s)"
+    )]
     devices: Vec<String>,
 
-    /// Baud rate
-    #[arg(short = 'b', long, default_value_t = 115200)]
+    /// Baud rate fallback for devices without an inline `baud=` override.
+    #[arg(short = 'b', long, default_value_t = 115200, help_heading = "Serial defaults")]
     baud: u32,
 
-    /// Data bits: 5, 6, 7, or 8.
-    #[arg(long, default_value_t = 8, value_parser = clap::value_parser!(u8).range(5..=8))]
+    /// Data bits: 5 / 6 / 7 / 8 (default 8).
+    #[arg(
+        long,
+        default_value_t = 8,
+        value_parser = clap::value_parser!(u8).range(5..=8),
+        help_heading = "Serial defaults"
+    )]
     data_bits: u8,
 
-    /// Parity: none | odd | even.
-    #[arg(long, default_value = "none")]
+    /// Parity: none | odd | even (default none).
+    #[arg(long, default_value = "none", help_heading = "Serial defaults")]
     parity: String,
 
-    /// Stop bits: 1 or 2.
-    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=2))]
+    /// Stop bits: 1 or 2 (default 1).
+    #[arg(
+        long,
+        default_value_t = 1,
+        value_parser = clap::value_parser!(u8).range(1..=2),
+        help_heading = "Serial defaults"
+    )]
     stop_bits: u8,
 
-    /// Flow control: none | software | hardware.
-    #[arg(long, default_value = "none")]
+    /// Flow control: none | software | hardware (default none).
+    #[arg(long, default_value = "none", help_heading = "Serial defaults")]
     flow_control: String,
 
-    /// Unix socket path.
-    ///
-    /// Default: `/tmp/tetherd.sock`, or `/tmp/tetherd-<NAME>.sock` if `--name`
-    /// is set. Use `--no-uds` to disable the UDS listener entirely (TCP only).
-    #[arg(short = 's', long)]
+    /// Unix socket path. Default: /tmp/tetherd.sock (or /tmp/tetherd-<NAME>.sock with `--name`).
+    #[arg(short = 's', long, help_heading = "Listeners")]
     socket: Option<PathBuf>,
 
-    /// Friendly name for this daemon instance.
+    /// Tag this daemon; defaults UDS to /tmp/tetherd-<NAME>.sock for side-by-side daemons.
     ///
-    /// Defaults the UDS socket to `/tmp/tetherd-<NAME>.sock`, so multiple
-    /// daemons (one per board) can run side-by-side without colliding.
-    /// Clients reach this daemon with `tether --name <NAME> ...`. Ignored
-    /// when `--socket` is given explicitly.
-    #[arg(long, value_name = "NAME")]
+    /// Clients then reach this daemon with `tether --name <NAME> ...`.
+    /// Ignored when `--socket` is given explicitly.
+    #[arg(long, value_name = "NAME", help_heading = "Listeners")]
     name: Option<String>,
 
-    /// Disable the Unix socket listener (TCP only).
-    #[arg(long)]
+    /// Disable the UDS listener (TCP only — requires `--tcp`).
+    #[arg(long, help_heading = "Listeners")]
     no_uds: bool,
 
-    /// Also listen on TCP. Use bare `--tcp` for the default `0.0.0.0:5557`
-    /// (network-reachable) or `--tcp HOST:PORT` for an explicit endpoint
-    /// (e.g. `--tcp 127.0.0.1:5557` for localhost only). Requires auth.
+    /// Also listen on TCP. Bare `--tcp` = 0.0.0.0:5557; `--tcp HOST:PORT` for an explicit bind.
     #[arg(
         long,
         value_name = "HOST:PORT",
         num_args = 0..=1,
         default_missing_value = "0.0.0.0:5557",
+        help_heading = "Listeners"
     )]
     tcp: Option<String>,
 
-    /// Auth token for TCP clients. Random token is generated if --tcp is set
-    /// without this flag (and printed to stderr at startup).
-    #[arg(long, value_name = "TOKEN")]
+    /// Auth token for TCP clients. If omitted with `--tcp`, a random token is generated and logged.
+    #[arg(long, value_name = "TOKEN", help_heading = "TCP auth")]
     auth_token: Option<String>,
 
-    /// Ring buffer capacity in bytes
-    #[arg(long, default_value_t = 65536)]
+    /// Ring buffer capacity in bytes per device (default 65536).
+    #[arg(long, default_value_t = 65536, help_heading = "Buffer")]
     buffer_capacity: usize,
 }
 
