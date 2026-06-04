@@ -171,16 +171,24 @@ enum Cmd {
         #[arg(long, default_value = "now", value_parser = ["start", "now"])]
         from: String,
     },
-    /// Stream device output to stdout.
+    /// Stream live device output to stdout, like `tail -f` (Ctrl-C to stop).
+    ///
+    /// Read-only: doesn't take the writer lock, so it runs alongside `send` /
+    /// `exec` / `shell` and other tails. Device data goes to stdout (redirect
+    /// it for a clean log); connect/disconnect events go to stderr.
     Tail {
-        #[arg(long, default_value = "now")]
+        /// Where to start: `now` = only new output from here; `start` = replay
+        /// what's still in the daemon's buffer first, then follow.
+        #[arg(long, default_value = "now", value_parser = ["now", "start"])]
         from: String,
     },
     /// Send CR and wait until the device goes idle; print the last line as a
     /// prompt candidate.
     Sync {
+        /// Treat the device as idle once this many ms pass with no new output.
         #[arg(long, default_value_t = 300)]
         idle_ms: u32,
+        /// Give up after this many ms if the device never goes idle.
         #[arg(long, default_value_t = 2000)]
         timeout_ms: u32,
     },
@@ -188,6 +196,7 @@ enum Cmd {
     // ──────── Scripted RPCs ────────
     /// Send data to the device. Does not wait for a response.
     Send {
+        /// Bytes to send (see --base64 / --newline).
         data: String,
         /// Treat `data` as base64.
         #[arg(long)]
@@ -196,32 +205,43 @@ enum Cmd {
         #[arg(long, default_value = "none", value_parser = ["none", "lf", "cr", "crlf"])]
         newline: String,
     },
-    /// Wait until a pattern appears.
+    /// Wait until a pattern appears in the device output.
     Expect {
+        /// Pattern to wait for (regex by default; use --literal for a fixed string).
         pattern: String,
+        /// Give up waiting for the pattern after this many ms.
         #[arg(long, default_value_t = 3000)]
         timeout_ms: u32,
+        /// Match `pattern` as a literal string instead of a regex.
         #[arg(long)]
         literal: bool,
+        /// Strip ANSI escape sequences before matching.
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         strip_ansi: bool,
+        /// Cap the captured pre-match output; keep only the last N bytes.
         #[arg(long, default_value_t = 8192)]
         max_output_bytes: u64,
     },
     /// Atomic send + expect executed on the server (holds the writer lock).
     Run {
+        /// Data/command to send before waiting for --until.
         data: String,
+        /// Pattern that ends the wait (regex by default; see --literal).
         #[arg(short = 'u', long)]
         until: String,
+        /// Give up waiting for --until after this many ms.
         #[arg(long, default_value_t = 3000)]
         timeout_ms: u32,
+        /// Match --until as a literal string instead of a regex.
         #[arg(long)]
         literal: bool,
+        /// Strip ANSI escape sequences before matching.
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         strip_ansi: bool,
         /// Strip the echoed command line from the response.
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         strip_echo: bool,
+        /// Cap the captured output; keep only the last N bytes.
         #[arg(long, default_value_t = 8192)]
         max_output_bytes: u64,
         /// Behaviour when the writer lock is contended.
@@ -230,6 +250,39 @@ enum Cmd {
         /// Append a line terminator to the data before sending.
         /// Most embedded shells (U-Boot, busybox, Linux login) want `crlf` or `lf`.
         #[arg(long, default_value = "none", value_parser = ["none", "lf", "cr", "crlf"])]
+        newline: String,
+    },
+    /// Run a shell command on the device and capture just its output.
+    ///
+    /// Wraps `<data>` so the device shell brackets the output with unique
+    /// markers and reports the command's exit status, then returns only the
+    /// bytes the command produced — no prompt-parsing or BEGIN/END scaffolding
+    /// on your side, and the echoed command line is dropped even when the
+    /// device terminal wraps it. The captured output goes to stdout; `tether
+    /// exec` then exits with the *device command's* status, like `ssh`. Pair
+    /// with `--json` to get `{output, exit_code, duration_ms}`.
+    ///
+    /// Assumes a POSIX-ish shell on the device (busybox, dash, bash, U-Boot
+    /// hush) sitting at a prompt. Not for raw/non-shell consoles — use
+    /// `send` + `expect` / `run` there.
+    Exec {
+        /// The command line to run on the device shell.
+        data: String,
+        /// Give up if the end-marker hasn't appeared after this many ms.
+        #[arg(long, default_value_t = 5000)]
+        timeout_ms: u32,
+        /// Strip ANSI escapes from the captured output.
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        strip_ansi: bool,
+        /// Cap the captured output; keep only the last N bytes.
+        #[arg(long, default_value_t = 65536)]
+        max_output_bytes: u64,
+        /// Behaviour when the writer lock is contended.
+        #[arg(long, default_value = "queue", value_parser = ["queue", "fail", "force"])]
+        preempt: String,
+        /// Line terminator used to submit the command. Serial consoles
+        /// usually want `cr`.
+        #[arg(long, default_value = "cr", value_parser = ["lf", "cr", "crlf"])]
         newline: String,
     },
 
@@ -286,6 +339,7 @@ enum Cmd {
     },
     /// Drive the RTS (Request To Send) output line.
     Rts {
+        /// `on` asserts the line; `off` deasserts.
         #[arg(value_parser = ["on", "off"])]
         state: String,
     },
@@ -360,6 +414,9 @@ fn main() -> ExitCode {
     let result = runtime.block_on(run(cli));
     match result {
         Ok(()) => ExitCode::SUCCESS,
+        // `exec` mirrors the device command's status. No extra message — the
+        // captured output already went to stdout.
+        Err(CliError::RemoteExit(code)) => ExitCode::from(code),
         Err(CliError::Timeout) => ExitCode::from(124),
         Err(CliError::DeviceDisconnected) => ExitCode::from(4),
         Err(CliError::BufferOverflow) => ExitCode::from(5),
@@ -389,6 +446,9 @@ fn main() -> ExitCode {
 #[derive(Debug)]
 enum CliError {
     Timeout,
+    /// `exec` only: the device command ran but returned a non-zero status,
+    /// which `tether exec` mirrors as its own exit code (ssh-style).
+    RemoteExit(u8),
     DeviceDisconnected,
     BufferOverflow,
     LockContention,
@@ -547,10 +607,8 @@ async fn find_daemon_managing_device(target: &str) -> Option<ExistingDaemon> {
         }
     });
 
-    for hit in join_all(probes).await.into_iter().flatten() {
-        return Some(hit);
-    }
-    None
+    // First daemon whose device path matches wins.
+    join_all(probes).await.into_iter().flatten().next()
 }
 
 /// Open one UDS socket, send `hello` + `list_devices`, return a hit if
@@ -752,7 +810,9 @@ async fn spawn_embedded_daemon(
                 let log = std::fs::read_to_string(&log_path).unwrap_or_default();
                 guard.child = None; // already reaped
                 return Err(CliError::Connection(format!(
-                    "tether: embedded tetherd exited (status {status}) before binding socket\n\n{log}"
+                    "tether: embedded tetherd exited (status {status}) before binding socket\
+                     {}\n\n{log}",
+                    dash_d_hint(device)
                 )));
             }
         }
@@ -761,6 +821,24 @@ async fn spawn_embedded_daemon(
     Err(CliError::Connection(format!(
         "tether: embedded tetherd did not bind {sock_path:?} within 5s"
     )))
+}
+
+/// When `-D <VALUE>` fails to launch an embedded daemon and `VALUE` doesn't
+/// look like a device path (no `/`, and nothing by that name on disk), the
+/// most likely mistake is uppercase `-D` (standalone PATH) where lowercase
+/// `-d` (select a device-id on an existing daemon) was meant. Return a hint
+/// to splice into the error, or an empty string when `VALUE` really is a path.
+fn dash_d_hint(value: &str) -> String {
+    let looks_like_path = value.contains('/') || std::path::Path::new(value).exists();
+    if looks_like_path {
+        String::new()
+    } else {
+        format!(
+            "\n\nhint: `-D {value}` starts a *new* standalone daemon and opens `{value}` as a \
+             device path — which doesn't exist. To select a device named `{value}` on an \
+             already-running daemon, use lowercase `-d {value}` instead."
+        )
+    }
 }
 
 /// 32-hex random token, matches the format `tetherd` itself uses when it
@@ -957,6 +1035,63 @@ where
                 Err(e) => return Err(e),
             }
         }
+        Cmd::Exec {
+            data,
+            timeout_ms,
+            strip_ansi,
+            max_output_bytes,
+            preempt,
+            newline,
+        } => {
+            let session_id = attach(&mut framed, &mut next_id, "now", cli.device_id.as_deref()).await?;
+            let (wrapped, until, begin_marker) = wrap_exec_command(&data);
+            let p = RunParams {
+                session_id,
+                data: None,
+                data_text: Some(apply_newline(wrapped, &newline)),
+                until: UntilSpec {
+                    pattern: until,
+                    regex: true,
+                    strip_ansi,
+                },
+                timeout_ms: Some(timeout_ms),
+                preempt,
+                // We bracket the output with begin/end markers and slice
+                // between them client-side, so the daemon's first-line echo
+                // stripping (which breaks on wrapped command lines) is off.
+                strip_echo: false,
+                max_bytes: None,
+                max_output_bytes: Some(max_output_bytes),
+            };
+            match call_or_retry(
+                &mut framed,
+                &mut next_id,
+                "run",
+                serde_json::to_value(p).unwrap(),
+                cli.auto_reconnect,
+            )
+            .await
+            {
+                Ok(v) => {
+                    let code = print_exec_result(&v, &begin_marker, cli.json);
+                    // Mirror the device command's status, ssh-style.
+                    return if code == 0 {
+                        Ok(())
+                    } else {
+                        Err(CliError::RemoteExit(code))
+                    };
+                }
+                Err(CliError::Timeout) => {
+                    eprintln!(
+                        "tether: exec timed out after {timeout_ms}ms — no end-marker seen. \
+                         Is the device at a shell prompt? (exec needs a POSIX-ish shell; \
+                         for raw consoles use `send` + `expect`.)"
+                    );
+                    return Err(CliError::Timeout);
+                }
+                Err(e) => return Err(e),
+            }
+        }
         Cmd::Tail { from } => {
             let session_id = attach(&mut framed, &mut next_id, &from, cli.device_id.as_deref()).await?;
             tail_loop(&mut framed, &session_id).await?;
@@ -1015,9 +1150,15 @@ where
                 } else if reconnected {
                     eprintln!("tether: reconnect succeeded but device state is uncertain");
                 } else {
-                    eprintln!(
-                        "tether: reconnect requested but device is still disconnected after {timeout_ms}ms"
-                    );
+                    let reason = v.get("reason").and_then(|s| s.as_str());
+                    match reason {
+                        Some(r) => eprintln!(
+                            "tether: reconnect requested but device is still disconnected after {timeout_ms}ms ({r})"
+                        ),
+                        None => eprintln!(
+                            "tether: reconnect requested but device is still disconnected after {timeout_ms}ms"
+                        ),
+                    }
                     return Err(CliError::DeviceDisconnected);
                 }
             }
@@ -1806,6 +1947,101 @@ fn print_match_result(v: &Value, force_json: bool) {
         summary.push(']');
         eprintln!("{summary}");
     }
+}
+
+/// Wrap a user command so the device shell brackets its output with two unique
+/// markers and reports the command's exit status. Returns `(wrapped_command,
+/// end_regex, begin_marker)`.
+///
+/// Each marker is split by an empty-string quote (`BE""G`) in the *typed* form,
+/// so the shell's echo of the command line can never contain the marker
+/// contiguously — only the shell's *evaluated* output does. The caller keeps
+/// only the bytes *between* the begin marker's line and the end marker, which
+/// makes the extraction immune to terminal line-wrapping of the echoed command
+/// (a long command that wraps at the device's column width would otherwise leak
+/// into the output). The random tag makes an accidental match in real command
+/// output effectively impossible.
+fn wrap_exec_command(cmd: &str) -> (String, String, String) {
+    use uuid::Uuid;
+    let tag = Uuid::new_v4().simple().to_string();
+    let tag = &tag[..12];
+    let begin_print = format!("TETHEREXECBEG{tag}");
+    let begin_typed = format!("TETHEREXECBE\"\"G{tag}");
+    let end_typed = format!("TETHEREXECEN\"\"D{tag}");
+    // `__trc=$?` captures the *command's* status before the end-marker echo.
+    let wrapped = format!(
+        "echo \"{begin_typed}\"; {cmd}; __trc=$?; echo \"{end_typed}=$__trc\""
+    );
+    let end_re = format!("TETHEREXECEND{tag}=(-?[0-9]+)");
+    (wrapped, end_re, begin_print)
+}
+
+/// Print an `exec` result and return the device-side exit code. In JSON mode
+/// emits `{output, exit_code, duration_ms, truncated}`. Otherwise the captured
+/// output goes to stdout verbatim and a one-line summary goes to stderr when
+/// it's a TTY or the command failed. `begin_marker` brackets the start of the
+/// real output (everything before and including its line is the echoed command
+/// and is discarded).
+fn print_exec_result(v: &Value, begin_marker: &str, force_json: bool) -> u8 {
+    let before_b64 = v.get("before").and_then(|s| s.as_str()).unwrap_or("");
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(before_b64)
+        .unwrap_or_default();
+    let raw = String::from_utf8_lossy(&bytes);
+    // Keep only what follows the begin marker's line; this drops the echoed
+    // command (even if the device terminal wrapped it across several lines).
+    let output = match raw.find(begin_marker) {
+        Some(pos) => {
+            let rest = &raw[pos + begin_marker.len()..];
+            let from = rest.find('\n').map(|i| i + 1).unwrap_or(rest.len());
+            rest[from..].to_string()
+        }
+        None => raw.to_string(),
+    };
+    // match_text looks like `TETHEREXECEND<tag>=<code>`; pull the trailing int.
+    let match_text = v.get("match").and_then(|s| s.as_str()).unwrap_or("");
+    let exit_code: u8 = match_text
+        .rsplit_once('=')
+        .and_then(|(_, n)| n.trim().parse::<i64>().ok())
+        .map(|n| n.clamp(0, 255) as u8)
+        .unwrap_or(0);
+    let truncated = v.get("truncated").and_then(|b| b.as_bool()).unwrap_or(false);
+    let duration_ms = v.get("duration_ms").and_then(|n| n.as_u64());
+
+    if force_json {
+        let mut obj = serde_json::Map::new();
+        obj.insert("output".into(), json!(output));
+        obj.insert("exit_code".into(), json!(exit_code));
+        if let Some(d) = duration_ms {
+            obj.insert("duration_ms".into(), json!(d));
+        }
+        obj.insert("truncated".into(), json!(truncated));
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&Value::Object(obj)).unwrap_or_default()
+        );
+        return exit_code;
+    }
+
+    print!("{output}");
+    if !output.is_empty() && !output.ends_with('\n') {
+        println!();
+    }
+    if exit_code != 0 || truncated || std::io::stderr().is_terminal() {
+        let mut summary = format!("[exit {exit_code}");
+        if let Some(d) = duration_ms {
+            summary.push_str(&format!(", {d}ms"));
+        }
+        if truncated {
+            match v.get("original_bytes").and_then(|n| n.as_u64()) {
+                Some(orig) => summary.push_str(&format!(", truncated from {orig}B")),
+                None => summary.push_str(", truncated"),
+            }
+        }
+        summary.push(']');
+        eprintln!("{summary}");
+    }
+    exit_code
 }
 
 /// Pull responses off `resp_rx` until we see one whose id matches the request

@@ -10,6 +10,63 @@ also apply.
 
 (Nothing yet.)
 
+## [0.9.5] — 2026-06-04
+
+### Changed
+- **Tidier per-command `--help`.** Every option now carries a one-line
+  description, so `tether <cmd> -h` no longer shows bare `[default: …]` entries
+  with no explanation. In particular `tail --from` documents its `now` / `start`
+  values (and now rejects anything else up front), and the undocumented options
+  on `expect`, `run`, `exec`, and `sync` — timeouts, `--literal`, `--strip-ansi`,
+  `--max-output-bytes` — gained short help. Positional arguments (`send`,
+  `expect`, `run` data/pattern) are described too. `tail`'s summary now spells
+  out that it's read-only, follows like `tail -f`, and splits data→stdout /
+  events→stderr.
+
+## [0.9.4] — 2026-06-04
+
+### Added
+- **`tether exec "<cmd>"` — run a shell command, capture just its output.** For
+  the common automation need ("send a command, get only its output back"),
+  `exec` wraps the command so the device shell brackets the output with two
+  unique markers and reports the command's exit status, then returns only the
+  bytes between them. No prompt pattern to guess and no BEGIN/END scaffolding to
+  hand-roll. The echoed command line is dropped even when the device terminal
+  wraps it across columns (begin/end markers are matched in the shell's
+  *evaluated* output, not its echo, via an empty-quote `BE""G` split). Output
+  goes to stdout and `tether exec` exits with the *device command's* status,
+  ssh-style; `--json` yields `{output, exit_code, duration_ms}`. Assumes a
+  POSIX-ish shell (busybox, dash, bash, U-Boot hush) at a prompt — for raw
+  consoles use `send` + `expect` / `run`. New integration tests
+  `exec_captures_output_and_zero_exit` and `exec_mirrors_nonzero_exit_and_json_shape`.
+
+### Fixed
+- **Out-of-order / garbled writes when a connection pipelines requests.** The
+  daemon used to dispatch *every* request on its own task, so a burst of
+  `send`s on a single connection (a pasted multi-line block, or an agent
+  pipelining commands) raced at the device writer and could reach the wire out
+  of order — observed as a rotated or garbled command line, and worse with
+  longer input since more chunks raced. Requests are now handled inline, in
+  arrival order; only the methods that genuinely block on device output
+  (`expect`, `run`, `reconnect`) still run on their own task, so a long
+  `expect` doesn't stall the rest of the connection. New integration test
+  `pipelined_sends_reach_the_wire_in_order` fires 64 sends back-to-back on one
+  connection and asserts the bytes arrive in issue order.
+
+### Changed
+- **`reconnect` now surfaces *why* the port is still down.** When a reconnect
+  times out with the device still disconnected, the daemon includes the last
+  disconnect reason (e.g. `No such file or directory`) in its reply and the
+  client prints it, so a vanished device path is diagnosed immediately instead
+  of a bare `still disconnected after Nms`.
+- **`-D <device-id>` mistakes get a pointed hint.** When `-D <VALUE>` fails to
+  start an embedded daemon and `VALUE` isn't a path (no `/`, nothing by that
+  name on disk), the error now suggests lowercase `-d <VALUE>` — the flag for
+  selecting a device on an already-running daemon — instead of leaving the
+  user puzzling over why a device-id couldn't be opened as a file.
+- Internal: rewrote the daemon-probe `for … { return }` loop as an iterator
+  `.next()` so `cargo clippy` (which denies `clippy::never_loop`) is clean again.
+
 ## [0.9.3] — 2026-05-20
 
 ### Added

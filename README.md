@@ -164,6 +164,27 @@ tether tail
 
 If the daemon isn't running, `tether` prints exactly how to start it.
 
+### Run a command, get just its output
+
+When the device is sitting at a POSIX-ish shell (busybox, dash, bash, U-Boot
+hush), `tether exec` runs a command and returns **only** its output — no prompt
+pattern to guess, no BEGIN/END scaffolding to write yourself. It brackets the
+command with unique markers on the wire, strips the echoed command line (even
+when the device terminal wraps it), and exits with the **device command's**
+status, like `ssh`:
+
+```sh
+tether exec "uname -a"                 # output to stdout, exit = remote status
+tether exec "test -f /etc/os-release"  # use the exit code in a script
+tether exec "cat /proc/uptime" --json  # {output, exit_code, duration_ms}
+
+# Composes like any shell command:
+if tether exec "grep -q ok /tmp/state"; then echo "ready"; fi
+```
+
+For raw / non-shell consoles (bootloaders mid-boot, custom firmware prompts),
+use `send` + `expect` or the server-side atomic `run` instead.
+
 ### Remote daemon (TCP)
 
 To drive a board attached to one host from another machine, start the daemon

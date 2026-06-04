@@ -412,13 +412,24 @@ pub async fn reconnect(
             }
         }
     }
-    let device_connected = device.state.lock().connected;
+    let (device_connected, reason) = {
+        let s = device.state.lock();
+        (s.connected, s.last_disconnect_reason.clone())
+    };
 
-    Ok(serde_json::json!({
+    let mut result = serde_json::json!({
         "triggered": true,
         "reconnected": reconnected_ok,
         "device_connected": device_connected,
-    }))
+    });
+    // Surface *why* the port is still down (e.g. "No such file or directory")
+    // so the client can give a precise diagnostic instead of a bare timeout.
+    if !device_connected {
+        if let Some(reason) = reason {
+            result["reason"] = serde_json::Value::String(reason);
+        }
+    }
+    Ok(result)
 }
 
 /// Enumerate the serial ports the daemon machine knows about.

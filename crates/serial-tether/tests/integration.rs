@@ -88,6 +88,63 @@ fn spawn_pty() -> Pty {
     Pty { child, path }
 }
 
+/// Both ends of a socat-created PTY pair. `a` is handed to the daemon as its
+/// device; bytes the daemon writes to `a` surface on `b`, so a test can read
+/// `b` to observe exactly what reached the wire (and in what order). Drop kills
+/// socat, releasing both endpoints.
+struct PtyPair {
+    child: Child,
+    pub a: String,
+    pub b: String,
+}
+
+impl Drop for PtyPair {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn spawn_pty_pair() -> PtyPair {
+    let stderr_path = format!(
+        "/tmp/tetherd-it-socat2-{}-{}.log",
+        std::process::id(),
+        unique_id()
+    );
+    let stderr_file = std::fs::File::create(&stderr_path).expect("create socat log");
+    let child = Command::new("socat")
+        .args(["-d", "-d", "pty,raw,echo=0", "pty,raw,echo=0"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(stderr_file))
+        .spawn()
+        .expect("spawn socat — is it installed?");
+
+    // socat prints both PTY paths to stderr (one "PTY is ..." line each).
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut paths: Vec<String> = Vec::new();
+    while Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+        if let Ok(content) = std::fs::read_to_string(&stderr_path) {
+            paths.clear();
+            for line in content.lines() {
+                if let Some(idx) = line.find("PTY is ") {
+                    let p = line[idx + "PTY is ".len()..].trim();
+                    if p.starts_with("/dev/") && p.len() > 5 {
+                        paths.push(p.to_string());
+                    }
+                }
+            }
+            if paths.len() >= 2 {
+                break;
+            }
+        }
+    }
+    let _ = std::fs::remove_file(&stderr_path);
+    assert!(paths.len() >= 2, "socat should print two /dev/pts paths within 2s");
+    std::thread::sleep(Duration::from_millis(100));
+    PtyPair { child, a: paths[0].clone(), b: paths[1].clone() }
+}
+
 // ---------- Daemon helper ----------
 
 struct Daemon {
@@ -499,6 +556,227 @@ fn standalone_with_tcp_exposes_remote_attachable_listener() {
         "remote client should see the embedded daemon's device"
     );
     assert_eq!(v["device"]["connected"].as_bool(), Some(true));
+}
+
+#[test]
+fn pipelined_sends_reach_the_wire_in_order() {
+    // Regression test for the concurrent-dispatch reorder bug: the daemon used
+    // to spawn every request on its own task, so a burst of `send`s on a single
+    // connection (a pasted block, or an agent pipelining commands) raced at the
+    // device writer and reached the wire out of order — observed as a rotated /
+    // garbled command line. Here we fire N sends back-to-back on ONE connection
+    // without waiting for replies, then read the far PTY end and assert the
+    // bytes arrived in exactly the order they were issued.
+    use base64::Engine as _;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::os::unix::net::UnixStream;
+
+    let pair = spawn_pty_pair();
+    let d = spawn_daemon(&[pair.a.clone()]);
+
+    // Reader thread on the far PTY end — collects whatever the daemon writes.
+    let dev_end = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&pair.b)
+        .expect("open far pty end");
+    let (bytes_tx, bytes_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    std::thread::spawn(move || {
+        let mut f = dev_end;
+        let mut buf = [0u8; 4096];
+        loop {
+            match f.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if bytes_tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut w = UnixStream::connect(&d.socket).expect("connect uds");
+    let mut r = BufReader::new(w.try_clone().expect("clone uds"));
+
+    fn write_req(s: &mut UnixStream, id: i64, method: &str, params: serde_json::Value) {
+        let req = serde_json::json!({"jsonrpc":"2.0","id":id,"method":method,"params":params});
+        let mut line = serde_json::to_vec(&req).unwrap();
+        line.push(b'\n');
+        s.write_all(&line).unwrap();
+        s.flush().unwrap();
+    }
+    fn read_result(r: &mut impl BufRead, id: i64) -> serde_json::Value {
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let n = r.read_line(&mut line).expect("read line");
+            assert!(n > 0, "eof before response id {id}");
+            let v: serde_json::Value = match serde_json::from_str(line.trim()) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if v.get("id").and_then(|x| x.as_i64()) == Some(id) {
+                if let Some(res) = v.get("result") {
+                    return res.clone();
+                }
+                panic!("error response for id {id}: {v}");
+            }
+            // ignore notifications / unrelated ids
+        }
+    }
+
+    // hello + attach (rw) to get a session.
+    write_req(
+        &mut w,
+        1,
+        "hello",
+        serde_json::json!({
+            "protocol_version": "1",
+            "client": {"name": "it", "version": "0", "kind": "agent"}
+        }),
+    );
+    let _ = read_result(&mut r, 1);
+    write_req(&mut w, 2, "attach", serde_json::json!({"mode": "rw", "replay": "now"}));
+    let session_id = read_result(&mut r, 2)["session_id"]
+        .as_str()
+        .expect("attach returns session_id")
+        .to_string();
+
+    // Fire N distinct 4-byte chunks back-to-back, NOT reading replies between
+    // them, so multiple requests are in flight on the one connection at once.
+    const N: usize = 64;
+    let mut expected: Vec<u8> = Vec::with_capacity(N * 4);
+    for i in 0..N {
+        let token = format!("{i:04}");
+        expected.extend_from_slice(token.as_bytes());
+        let b64 = base64::engine::general_purpose::STANDARD.encode(token.as_bytes());
+        write_req(
+            &mut w,
+            100 + i as i64,
+            "send",
+            serde_json::json!({"session_id": session_id, "data": b64}),
+        );
+    }
+
+    // Drain the far end until we've seen every byte (or time out).
+    let mut got: Vec<u8> = Vec::with_capacity(N * 4);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while got.len() < expected.len() && Instant::now() < deadline {
+        match bytes_rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(chunk) => got.extend_from_slice(&chunk),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(_) => break,
+        }
+    }
+
+    assert_eq!(
+        String::from_utf8_lossy(&got),
+        String::from_utf8_lossy(&expected),
+        "pipelined sends must reach the wire in issue order (no reordering)"
+    );
+}
+
+/// Spawn a crude POSIX-shell emulator on the far PTY end so `tether exec` has
+/// something to talk to. For each line the daemon writes (the wrapped command,
+/// terminated by CR), it writes back: the terminal echo of that line, one line
+/// of canned output, then the synthesized end-marker line (`TETHEREXEC<tag>=N`)
+/// that `exec` greps for. The exit code is 7 when the command mentions `FAIL`,
+/// else 0 — enough to test status passthrough. The thread runs until the PTY
+/// closes.
+fn spawn_fake_shell(path: &str) {
+    use std::io::{Read, Write};
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .expect("open far pty end for fake shell");
+    std::thread::spawn(move || {
+        let mut f = f;
+        let mut buf = [0u8; 4096];
+        let mut line: Vec<u8> = Vec::new();
+        loop {
+            let n = match f.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(_) => break,
+            };
+            for &b in &buf[..n] {
+                if b == b'\r' || b == b'\n' {
+                    if line.is_empty() {
+                        continue;
+                    }
+                    let cmd = String::from_utf8_lossy(&line).to_string();
+                    line.clear();
+                    // Terminal echo of the submitted line.
+                    let mut out = format!("{cmd}\r\n");
+                    // Synthesize what the wrapped command prints: the begin
+                    // marker, one line of canned output, then the end marker
+                    // with the exit code — recovering the tag from the typed
+                    // begin marker (strip its `""`).
+                    let needle = "TETHEREXECBE\"\"G";
+                    if let Some(idx) = cmd.find(needle) {
+                        let after = &cmd[idx + needle.len()..];
+                        if after.len() >= 12 {
+                            let tag = &after[..12];
+                            let code = if cmd.contains("FAIL") { 7 } else { 0 };
+                            out.push_str(&format!("TETHEREXECBEG{tag}\r\n"));
+                            out.push_str("tether-exec-output\r\n");
+                            out.push_str(&format!("TETHEREXECEND{tag}={code}\r\n"));
+                        }
+                    }
+                    let _ = f.write_all(out.as_bytes());
+                    let _ = f.flush();
+                } else {
+                    line.push(b);
+                }
+            }
+        }
+    });
+}
+
+#[test]
+fn exec_captures_output_and_zero_exit() {
+    // `tether exec` should run a command on the (emulated) device shell, print
+    // only the command's output, and exit 0.
+    let pair = spawn_pty_pair();
+    spawn_fake_shell(&pair.b);
+    let d = spawn_daemon(&[pair.a.clone()]);
+
+    let (code, stdout, stderr) = tether_exit(&d, &["exec", "echo hi"]);
+    assert_eq!(code, 0, "exec should exit 0\nstderr:\n{stderr}");
+    assert!(
+        stdout.contains("tether-exec-output"),
+        "exec stdout should carry the command output, got:\n{stdout}"
+    );
+    // The echoed command line must be stripped — no marker scaffolding leaks.
+    assert!(
+        !stdout.contains("TETHEREXEC") && !stdout.contains("__trc"),
+        "exec stdout leaked marker/scaffolding:\n{stdout}"
+    );
+}
+
+#[test]
+fn exec_mirrors_nonzero_exit_and_json_shape() {
+    // A failing device command propagates its status, and --json exposes
+    // {output, exit_code}.
+    let pair = spawn_pty_pair();
+    spawn_fake_shell(&pair.b);
+    let d = spawn_daemon(&[pair.a.clone()]);
+
+    let (code, _stdout, stderr) = tether_exit(&d, &["exec", "do FAIL now"]);
+    assert_eq!(code, 7, "exec should mirror the device exit code\nstderr:\n{stderr}");
+
+    let v = tether_json(&d, &["exec", "do FAIL now"]);
+    assert_eq!(v.get("exit_code").and_then(|n| n.as_u64()), Some(7));
+    assert!(
+        v.get("output")
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .contains("tether-exec-output"),
+        "exec --json should include decoded output, got: {v}"
+    );
 }
 
 #[test]

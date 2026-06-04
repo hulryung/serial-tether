@@ -209,19 +209,34 @@ where
             Message::Response(_) => continue,
         };
 
+        // Ordering matters. Requests on a single connection must take effect
+        // in the order they arrive — otherwise a pasted multi-line block or a
+        // rapid burst of `send`s races at the device writer and reaches the
+        // wire out of order (observed as a rotated / garbled command line, and
+        // worse with longer input since more chunks race). We therefore handle
+        // requests inline, in arrival order, and only spawn the handful of
+        // methods that block on device output, so a long `expect` still
+        // doesn't stall the rest of the connection.
         let state_cl = state.clone();
         let conn_cl = conn.clone();
-        let out_tx_cl = out_tx.clone();
-        // Run each request on its own task so a blocking `expect` doesn't
-        // hold up subsequent requests.
-        tokio::spawn(async move {
+        if is_blocking_method(&req.method) {
+            let out_tx_cl = out_tx.clone();
+            tokio::spawn(async move {
+                let resp = dispatch(&state_cl, &conn_cl, &req.method, req.params).await;
+                let response = match resp {
+                    Ok(value) => Response::ok(req.id, value),
+                    Err(e) => Response::err(req.id, e),
+                };
+                let _ = out_tx_cl.send(Message::Response(response));
+            });
+        } else {
             let resp = dispatch(&state_cl, &conn_cl, &req.method, req.params).await;
             let response = match resp {
                 Ok(value) => Response::ok(req.id, value),
                 Err(e) => Response::err(req.id, e),
             };
-            let _ = out_tx_cl.send(Message::Response(response));
-        });
+            let _ = out_tx.send(Message::Response(response));
+        }
     }
 
     // Cleanup.
@@ -233,6 +248,15 @@ where
         state.sessions.remove(&sid);
     }
     Ok(())
+}
+
+/// Methods that may block for a long time waiting on device output (a pattern
+/// match or a reconnect). These run on their own task so they don't stall
+/// in-order processing of the rest of the connection. Everything else — most
+/// importantly `send` — is dispatched inline, in arrival order, so writes reach
+/// the device in exactly the order the client issued them.
+fn is_blocking_method(method: &str) -> bool {
+    matches!(method, "expect" | "run" | "reconnect")
 }
 
 async fn dispatch(
