@@ -42,12 +42,13 @@ EXAMPLES:
 
 COMMANDS BY CATEGORY:
     Interactive:    shell, tail, sync
-    Scripted RPCs:  send, expect, run
-    Inspection:     status, list-devices, ports, config
+    Scripted RPCs:  send, expect, run, exec
+    Inspection:     status, list-devices, ports, config, agents
     Line control:   break, dtr, rts, lines
     Lifecycle:      reconnect, disconnect, connect
 
 LEARN MORE:
+    Agents: run `tether agents` for a ready-to-use cookbook (no daemon needed).
     AI-agent setup (paste-and-go AGENTS.md / CLAUDE.md block):
         https://github.com/hulryung/serial-tether/blob/main/docs/AI_AGENT_GUIDE.md
     Cookbook the agent itself reads (canonical command + pitfalls):
@@ -57,6 +58,57 @@ LEARN MORE:
     Source / issues:
         https://github.com/hulryung/serial-tether
 ";
+
+/// Self-contained agent cookbook printed by `tether agents`. Kept current with
+/// the CLI so an agent can learn the tool from one local command, no network.
+const AGENTS_GUIDE: &str = r#"# Using `tether` (serial console for agents)
+
+`tether` talks to a serial device through the `tetherd` daemon. The daemon owns
+the port; you attach as a client. You don't start or manage the daemon.
+
+## Rules — read first
+- ALWAYS target a device explicitly with `-d <id>`. Multi-device daemons require
+  it; without it you get an `AmbiguousDevice` error (or, on a TTY, a menu).
+- Export `TETHER_NONINTERACTIVE=1` so tether never blocks on a prompt, even if
+  your harness allocates a PTY. (Same as the `--no-interactive` flag.)
+- Prefer `exec` for shell commands: it returns just the output and the device's
+  own exit status.
+
+## Discover what's connected
+    tether list-devices --json      # ids, paths, connected state
+    tether status --json            # daemon + default device
+
+## Run a command and capture only its output (device at a shell prompt)
+    tether -d <id> exec "<cmd>"          # stdout = output; exit = device status
+    tether -d <id> exec "<cmd>" --json   # {output, exit_code, duration_ms}
+    # exits with the device command's status, like ssh:
+    if tether -d <id> exec "test -f /etc/os-release"; then echo yes; fi
+
+## Raw / non-shell console (bootloader, login prompt)
+    tether -d <id> run "<cmd>" -u "<prompt-regex>" --newline crlf --json
+    tether -d <id> send "<bytes>" --newline cr
+    tether -d <id> expect "<pattern>" --timeout-ms 5000
+
+## Observe live output
+    tether -d <id> tail                 # follow, like tail -f (Ctrl-C to stop)
+    tether -d <id> tail --from start    # replay what's buffered, then follow
+
+## Exit codes
+    0 ok   2 protocol   3 connection   4 disconnected   5 buffer-overflow
+    6 lock-contention   7 unauthorized   124 timeout
+    (exec additionally passes through the device command's own exit status)
+
+## Remote daemon (over TCP)
+    export TETHER_AUTH_TOKEN=<token>
+    tether -s tcp://<host>:5557 -d <id> exec "<cmd>"
+
+## Pitfalls
+- No `-d` on a multi-device daemon → error. Always pass `-d <id>`.
+- Don't pass a raw /dev path in scripts (`tether /dev/...`): it spawns or
+  redirects a daemon. Use `-d <id>` against the shared daemon instead.
+- `exec` assumes a POSIX shell on the device. For raw consoles use run/send/expect.
+- `output` (in --json) is decoded UTF-8 with ANSI/echo stripped — use it, not `before`.
+"#;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -105,6 +157,12 @@ struct Cli {
     /// hiccup. Off by default.
     #[arg(long, global = true, help_heading = "Output")]
     auto_reconnect: bool,
+
+    /// Never prompt: disable the interactive port / device pickers and fail
+    /// with the usual error instead. For agents and automation that may run
+    /// under a PTY. Setting `TETHER_NONINTERACTIVE=1` does the same.
+    #[arg(long, global = true, help_heading = "Output")]
+    no_interactive: bool,
 
     /// Auth token for TCP transport (alternative to TETHER_AUTH_TOKEN env var).
     #[arg(long, global = true, env = "TETHER_AUTH_TOKEN", help_heading = "TCP auth")]
@@ -301,6 +359,13 @@ enum Cmd {
     /// `ports` array on platforms that can't enumerate (e.g. restricted
     /// containers).
     Ports,
+    /// Print a ready-to-use cookbook for AI agents and exit (no daemon needed).
+    ///
+    /// Tell an agent to run `tether agents` first — it prints the canonical
+    /// commands (`-d <id> exec …`), the non-interactive contract, exit codes,
+    /// and the common pitfalls. The output is also fine to paste into an
+    /// `AGENTS.md` / `CLAUDE.md` block.
+    Agents,
     /// Show or change the live serial configuration.
     ///
     /// With no flags: prints the current device settings.
@@ -482,7 +547,189 @@ enum Endpoint<'a> {
     Tcp(&'a str),
 }
 
+/// A serial port the convenience picker can offer.
+struct PortChoice {
+    path: String,
+    label: String,
+}
+
+/// Discover USB serial ports worth offering in the auto-start picker.
+///
+/// Filters the raw `available_ports()` list down to real USB serial adapters
+/// (drops virtual junk like `*-Bluetooth-Incoming-Port` / `*.debug-console`).
+/// On macOS each device shows up twice — `/dev/cu.*` (call-out, the right node
+/// to open) and `/dev/tty.*` (dial-in) — so the dial-in duplicates are dropped.
+/// The `tty.` test is the macOS dial-in pattern (note the dot); Linux nodes
+/// like `/dev/ttyUSB0` have no dot and are kept.
+fn discover_usb_ports() -> Vec<PortChoice> {
+    let ports = match tokio_serial::available_ports() {
+        Ok(p) => p,
+        Err(_) => return Vec::new(),
+    };
+    select_port_choices(ports.into_iter().map(|p| {
+        let desc = match &p.port_type {
+            tokio_serial::SerialPortType::UsbPort(info) => Some(
+                info.product
+                    .clone()
+                    .or_else(|| info.manufacturer.clone())
+                    .unwrap_or_default(),
+            ),
+            _ => None, // not USB → desc None signals "skip"
+        };
+        (p.port_name, desc)
+    }))
+}
+
+/// Pure filtering/labeling rule behind [`discover_usb_ports`], split out so it
+/// can be unit-tested without real hardware. Input is `(path, usb_desc)` where
+/// `usb_desc` is `Some` only for USB serial adapters. Keeps USB ports, drops
+/// macOS dial-in duplicates (`/dev/tty.*`, note the dot — Linux `/dev/ttyUSB0`
+/// has none and is kept), and builds a display label.
+fn select_port_choices<I>(ports: I) -> Vec<PortChoice>
+where
+    I: IntoIterator<Item = (String, Option<String>)>,
+{
+    ports
+        .into_iter()
+        .filter_map(|(path, desc)| {
+            let desc = desc?; // None → not USB → skip
+            if path.starts_with("/dev/tty.") {
+                return None;
+            }
+            let label = if desc.is_empty() {
+                path.clone()
+            } else {
+                format!("{path}  ({desc})")
+            };
+            Some(PortChoice { path, label })
+        })
+        .collect()
+}
+
+/// Print a numbered menu to stderr and read a 1-based choice from stdin.
+/// Returns the selected index, or `None` when not interactive, on EOF, or on an
+/// invalid/blank-with-no-default entry. Pressing Enter selects the first item.
+fn pick_index(title: &str, labels: &[String], interactive: bool) -> Option<usize> {
+    use std::io::Write as _;
+    if labels.is_empty() || !interactive {
+        return None;
+    }
+    let mut err = std::io::stderr();
+    let _ = writeln!(err, "{title}");
+    for (i, l) in labels.iter().enumerate() {
+        let _ = writeln!(err, "  {}) {l}", i + 1);
+    }
+    let _ = write!(err, "Select [1-{}] (Enter=1): ", labels.len());
+    let _ = err.flush();
+    let mut line = String::new();
+    if std::io::stdin().read_line(&mut line).ok()? == 0 {
+        return None;
+    }
+    let s = line.trim();
+    if s.is_empty() {
+        return Some(0);
+    }
+    match s.parse::<usize>() {
+        Ok(n) if (1..=labels.len()).contains(&n) => Some(n - 1),
+        _ => {
+            let _ = writeln!(err, "tether: invalid selection — aborting.");
+            None
+        }
+    }
+}
+
+/// Whether `TETHER_NONINTERACTIVE` is set to a truthy value. Read manually
+/// (not via clap's `env`) so the natural `TETHER_NONINTERACTIVE=1` works —
+/// clap's bool-from-env only accepts `true`/`false`.
+fn env_forces_noninteractive() -> bool {
+    match std::env::var("TETHER_NONINTERACTIVE") {
+        Ok(v) => {
+            let v = v.trim().to_ascii_lowercase();
+            !matches!(v.as_str(), "" | "0" | "false" | "no" | "off")
+        }
+        Err(_) => false,
+    }
+}
+
+/// True when it's safe to show an interactive prompt: stdin and stderr are both
+/// a terminal AND the caller hasn't opted out (`--no-interactive` /
+/// `TETHER_NONINTERACTIVE`). Scripts, pipes, and agents stay non-prompting.
+fn interactive_allowed(no_interactive: bool) -> bool {
+    !no_interactive
+        && !env_forces_noninteractive()
+        && std::io::stdin().is_terminal()
+        && std::io::stderr().is_terminal()
+}
+
+/// Quick liveness probe: can we open the daemon's UDS? A stale socket file
+/// (crashed daemon) refuses the connection and reports `false`.
+async fn uds_daemon_alive(path: &str) -> bool {
+    UnixStream::connect(path).await.is_ok()
+}
+
+/// Commands that don't target a specific device (so the multi-device picker
+/// shouldn't fire for them).
+fn command_needs_device(cmd: &Cmd) -> bool {
+    !matches!(cmd, Cmd::Status | Cmd::ListDevices | Cmd::Ports | Cmd::Agents)
+}
+
+/// Convenience picker for a daemon that manages more than one device when the
+/// user didn't pass `-d`. Interactive terminals get a menu; everything else
+/// returns `None` so the per-command `AmbiguousDevice` error still fires (and
+/// scripts keep working). A single-device daemon also returns `None` — the
+/// daemon auto-selects the only device server-side.
+async fn maybe_pick_device<S>(
+    framed: &mut Framed<S, NdjsonCodec>,
+    next_id: &mut i64,
+    interactive: bool,
+) -> Result<Option<String>, CliError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    if !interactive {
+        return Ok(None);
+    }
+    let v = call(framed, next_id, "list_devices", json!({})).await?;
+    let devices = v
+        .get("devices")
+        .and_then(|d| d.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if devices.len() <= 1 {
+        return Ok(None);
+    }
+    let labels: Vec<String> = devices
+        .iter()
+        .map(|d| {
+            let id = d.get("id").and_then(|s| s.as_str()).unwrap_or("?");
+            let path = d.get("path").and_then(|s| s.as_str()).unwrap_or("");
+            let connected = d.get("connected").and_then(|b| b.as_bool()).unwrap_or(false);
+            let mark = if connected { "" } else { "  (disconnected)" };
+            format!("{id}  [{path}]{mark}")
+        })
+        .collect();
+    match pick_index(
+        "tether: this daemon manages several devices. Pick one:",
+        &labels,
+        interactive,
+    ) {
+        Some(i) => Ok(devices[i].get("id").and_then(|s| s.as_str()).map(String::from)),
+        None => Ok(None),
+    }
+}
+
 async fn run(mut cli: Cli) -> Result<(), CliError> {
+    // `tether agents` is pure local output — no daemon, no device. Handle it
+    // before any connection logic so an agent can read it with nothing set up.
+    if matches!(cli.cmd, Some(Cmd::Agents)) {
+        print!("{AGENTS_GUIDE}");
+        return Ok(());
+    }
+
+    // Whether the user pinned an endpoint. When they didn't (bare `tether`),
+    // we may auto-start a session daemon below instead of erroring out.
+    let explicit_endpoint = cli.socket.is_some() || cli.name.is_some();
+
     // Resolve --socket vs --name vs default into a single canonical endpoint
     // string, then keep using cli.socket as the source of truth (so
     // standalone mode can still rewrite it after spawning the daemon).
@@ -492,6 +739,58 @@ async fn run(mut cli: Cli) -> Result<(), CliError> {
         (None, None) => "/tmp/tetherd.sock".to_string(),
     };
     cli.socket = Some(resolved);
+
+    // Convenience: bare `tether` (default endpoint, no device pinned) with no
+    // daemon running. Instead of erroring, pick a serial port interactively and
+    // fall through to standalone mode — an ephemeral daemon that lives only for
+    // this session, like `tio /dev/ttyUSB0`. Only fires in an interactive
+    // terminal; scripts/pipes keep the original "no daemon" error so automation
+    // isn't surprised by a prompt.
+    let interactive = interactive_allowed(cli.no_interactive);
+    if !explicit_endpoint && cli.device.is_none() && cli.device_id.is_none() && interactive {
+        if let Endpoint::Uds(path) = endpoint_kind(cli.socket.as_deref().unwrap()) {
+            if !uds_daemon_alive(path).await {
+                let ports = discover_usb_ports();
+                match ports.len() {
+                    0 => {
+                        return Err(CliError::Connection(
+                            "tether: no USB serial ports found. Plug one in, or name it explicitly:\n  \
+                             tether /dev/<port>            (one-off session)\n  \
+                             tetherd -D /dev/<port> -b ...  (long-lived daemon)"
+                                .into(),
+                        ));
+                    }
+                    1 => {
+                        eprintln!(
+                            "tether: no daemon running — opening {} for this session.",
+                            ports[0].path
+                        );
+                        cli.device = Some(ports[0].path.clone());
+                    }
+                    _ => {
+                        let labels: Vec<String> = ports.iter().map(|p| p.label.clone()).collect();
+                        match pick_index(
+                            "tether: no daemon running. Pick a serial port to open (this session only):",
+                            &labels,
+                            interactive,
+                        ) {
+                            Some(i) => {
+                                eprintln!("tether: opening {} for this session.", ports[i].path);
+                                cli.device = Some(ports[i].path.clone());
+                            }
+                            None => {
+                                return Err(CliError::Connection(
+                                    "tether: several serial ports found — pick one explicitly:\n  \
+                                     tether /dev/<port> ..."
+                                        .into(),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     // If the user (or AI agent) asked for standalone mode but a daemon is
     // already managing this exact device path, attach to that daemon as a
@@ -899,7 +1198,7 @@ fn make_tcp_connect_error(addr: &str, e: std::io::Error) -> CliError {
     CliError::Connection(msg)
 }
 
-async fn run_with_stream<S>(mut framed: Framed<S, NdjsonCodec>, cli: Cli) -> Result<(), CliError>
+async fn run_with_stream<S>(mut framed: Framed<S, NdjsonCodec>, mut cli: Cli) -> Result<(), CliError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -923,6 +1222,20 @@ where
     .await?;
 
     let cmd = cli.cmd.clone().unwrap_or(Cmd::Shell { from: "now".into() });
+
+    // Convenience: a multi-device daemon with no `-d` selected. In an
+    // interactive terminal, let the user pick which device to act on; otherwise
+    // leave `device_id` unset so the per-command `AmbiguousDevice` error fires
+    // (preserving scripted behavior). Skipped for commands that don't target a
+    // device (status / list-devices / ports).
+    if cli.device_id.is_none() && command_needs_device(&cmd) {
+        let interactive = interactive_allowed(cli.no_interactive);
+        if let Some(id) = maybe_pick_device(&mut framed, &mut next_id, interactive).await? {
+            eprintln!("tether: using device `{id}`.");
+            cli.device_id = Some(id);
+        }
+    }
+
     match cmd {
         Cmd::Status => {
             let v = call(&mut framed, &mut next_id, "status", json!({})).await?;
@@ -1105,6 +1418,8 @@ where
             let v = call(&mut framed, &mut next_id, "list_ports", json!({})).await?;
             print_ports(&v, cli.json);
         }
+        // Handled in `run()` before any connection; arm kept for exhaustiveness.
+        Cmd::Agents => print!("{AGENTS_GUIDE}"),
         Cmd::Config {
             baud,
             data_bits,
@@ -1118,12 +1433,27 @@ where
                 || stop_bits.is_some()
                 || flow_control.is_some();
             if !any {
-                // Read-only: pull current device info from `status`.
+                // Read-only: pull current device info from `status`. Pick the
+                // targeted device out of the `devices` array (falling back to
+                // the daemon's default) so `-d <id>` shows the right port.
                 let v = call(&mut framed, &mut next_id, "status", json!({})).await?;
-                let device = v.get("device").cloned().unwrap_or(json!({}));
+                let want = cli.device_id.clone().or_else(|| {
+                    v.get("default_device").and_then(|s| s.as_str()).map(String::from)
+                });
+                let device = v
+                    .get("devices")
+                    .and_then(|a| a.as_array())
+                    .and_then(|arr| {
+                        arr.iter()
+                            .find(|d| d.get("id").and_then(|s| s.as_str()) == want.as_deref())
+                    })
+                    .and_then(|d| d.get("device").cloned())
+                    .or_else(|| v.get("device").cloned())
+                    .unwrap_or(json!({}));
                 print_device_config(&device, cli.json);
             } else {
                 let mut p = serde_json::Map::new();
+                if let Some(d) = &cli.device_id { p.insert("device_id".into(), json!(d)); }
                 if let Some(v) = baud { p.insert("baud".into(), json!(v)); }
                 if let Some(v) = data_bits { p.insert("data_bits".into(), json!(v)); }
                 if let Some(v) = parity { p.insert("parity".into(), json!(v)); }
@@ -2200,5 +2530,60 @@ fn val_compact(v: &Value) -> String {
         serde_json::to_string(v).unwrap_or_default()
     } else {
         v.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn select_port_choices_keeps_usb_cu_drops_tty_and_nonusb() {
+        // Mirrors what macOS `available_ports()` returns: cu/tty pairs plus
+        // virtual non-USB entries. Only the USB call-out (`cu.*`) nodes survive.
+        let input = vec![
+            ("/dev/cu.debug-console".to_string(), None),
+            ("/dev/tty.debug-console".to_string(), None),
+            (
+                "/dev/cu.usbserial-0001".to_string(),
+                Some("CP2102 USB to UART".to_string()),
+            ),
+            (
+                "/dev/tty.usbserial-0001".to_string(),
+                Some("CP2102 USB to UART".to_string()),
+            ),
+            ("/dev/cu.usbserial-3".to_string(), Some(String::new())),
+            ("/dev/tty.usbserial-3".to_string(), Some(String::new())),
+        ];
+        let got = select_port_choices(input);
+        let paths: Vec<&str> = got.iter().map(|c| c.path.as_str()).collect();
+        assert_eq!(paths, ["/dev/cu.usbserial-0001", "/dev/cu.usbserial-3"]);
+        // Label carries the description when present, bare path otherwise.
+        assert_eq!(got[0].label, "/dev/cu.usbserial-0001  (CP2102 USB to UART)");
+        assert_eq!(got[1].label, "/dev/cu.usbserial-3");
+    }
+
+    #[test]
+    fn select_port_choices_keeps_linux_ttyusb() {
+        // Linux nodes are `/dev/ttyUSB0` (no dot) — must NOT be filtered.
+        let input = vec![
+            ("/dev/ttyUSB0".to_string(), Some("FT232".to_string())),
+            ("/dev/ttyACM0".to_string(), Some(String::new())),
+        ];
+        let paths: Vec<String> = select_port_choices(input)
+            .into_iter()
+            .map(|c| c.path)
+            .collect();
+        assert_eq!(paths, ["/dev/ttyUSB0", "/dev/ttyACM0"]);
+    }
+
+    #[test]
+    fn command_needs_device_excludes_inspection_commands() {
+        assert!(!command_needs_device(&Cmd::Status));
+        assert!(!command_needs_device(&Cmd::ListDevices));
+        assert!(!command_needs_device(&Cmd::Ports));
+        assert!(!command_needs_device(&Cmd::Agents));
+        assert!(command_needs_device(&Cmd::Tail { from: "now".into() }));
+        assert!(command_needs_device(&Cmd::Lines));
     }
 }

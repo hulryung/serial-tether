@@ -10,6 +10,41 @@ also apply.
 
 (Nothing yet.)
 
+## [0.10.0] — 2026-06-24
+
+### Added
+- **`tether agents` — a built-in, ready-to-use cookbook for AI agents.** Tell an
+  agent to run `tether agents` and it prints (to stdout, no daemon needed) the
+  canonical commands (`-d <id> exec …`), the non-interactive contract, the exit
+  codes, remote-over-TCP usage, and the common pitfalls — current with the CLI
+  and fine to paste into an `AGENTS.md` / `CLAUDE.md` block.
+- **Non-interactive kill switch for agents/automation.** `--no-interactive` (or
+  `TETHER_NONINTERACTIVE=1`) disables the port/device pickers and falls back to
+  the usual error, so a harness that runs under a PTY can't get stuck on a
+  prompt. (Pickers were already TTY-gated; this is the explicit override for
+  PTY-allocating agents. The env var accepts `1`/`true`/`yes`, etc.)
+- **Zero-config `tether`: auto-start and interactive device selection.** You no
+  longer need to know whether a daemon is running. Running a device-targeting
+  command with no endpoint and no `-d`:
+  - **No daemon?** `tether` discovers the USB serial ports and, in an
+    interactive terminal, lets you pick one (auto-selected if there's exactly
+    one), then opens it as a session-scoped daemon — like `tio /dev/ttyUSB0`,
+    gone when you exit. macOS dial-in (`/dev/tty.*`) duplicates and virtual
+    ports are filtered out so the menu only lists real adapters (`/dev/cu.*`,
+    `/dev/ttyUSB*`).
+  - **Daemon with several devices and no `-d`?** It prints a numbered menu of
+    the managed devices and uses your pick (Enter selects the first).
+  Both prompts only appear on an interactive TTY; pipes and scripts keep the
+  previous behavior exactly — the "no daemon" hint or the `AmbiguousDevice`
+  error — so automation is never blocked on a prompt. Long-lived shared daemons
+  started explicitly with `tetherd` are unchanged.
+
+### Fixed
+- **`config` now respects `-d <id>` on multi-device daemons.** The read-only
+  form was reading the daemon's *default* device from `status`, and the
+  set form (`config --baud …`) was applying to the default device, both
+  ignoring `-d`. They now target (and display) the selected device.
+
 ## [0.9.5] — 2026-06-04
 
 ### Changed

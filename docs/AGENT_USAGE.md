@@ -1,6 +1,7 @@
 # Serial Tether — Guide for AI Agents
 
 > One page. Read once. You can drive an embedded serial console after this.
+> The same cookbook is available offline straight from the CLI: **`tether agents`**.
 >
 > **Want the *why* before the *how*?** Read [OVERVIEW.md](OVERVIEW.md) first
 > for the mental model and architecture. This file is a script-level cookbook.
@@ -10,37 +11,80 @@ to a serial device through the `tetherd` daemon. The daemon owns the port;
 you attach either over a Unix socket (local) or directly via TCP with a token
 (remote — see "Remote daemons" below).
 
-## Single canonical command
+## Rules — read these first
+
+1. **Target the device explicitly with `-d <id>`.** Multi-device daemons
+   require it (they answer `-32015 ambiguous_device` otherwise). Discover ids
+   with `tether list-devices --json`. Single-device daemons let you omit it.
+2. **Stay non-interactive: `export TETHER_NONINTERACTIVE=1`** (or pass
+   `--no-interactive`). When a device/port is ambiguous *and* tether detects a
+   terminal, it may show an interactive picker — which would hang an agent that
+   runs under a PTY. With this set it fails fast with the normal error instead.
+   Plain pipes/scripts are already non-interactive.
+3. **Always `--json` for scripted calls.** Never parse human-readable output.
+4. **Prefer `exec` for shell commands, `run` for raw consoles** (next section).
+
+## Two canonical commands
+
+### Device at a POSIX shell prompt → `exec`
+
+Busybox / Linux / dash / U-Boot hush sitting at a prompt:
 
 ```sh
-tether --json run "<COMMAND>" --newline crlf -u "<PROMPT_REGEX>" --timeout-ms <T>
+tether -d <id> exec "<command>"            # stdout = the command's output
+tether -d <id> exec "<command>" --json     # {output, exit_code, duration_ms}
 ```
 
-This is the form you should reach for in 95% of cases. It:
+`exec` wraps the command so the device shell brackets its output with unique
+markers, returns only the bytes the command produced (echoed command stripped,
+even when the terminal wraps a long line), and **exits with the device
+command's own status, like `ssh`**:
 
-- Sends `<COMMAND>` plus `\r\n` over the wire (most embedded shells expect that).
-- Holds a writer lock at the daemon, so other clients can't interleave bytes.
-- Waits for `<PROMPT_REGEX>` to appear, with a hard timeout.
-- Returns a JSON object with the decoded response.
+```sh
+if tether -d board0 exec "test -f /etc/os-release"; then echo present; fi
+```
 
-`--newline lf` if the device wants Unix line endings. `--newline none` (default)
-if the command already contains the newline you want.
+No prompt to detect, no `--until` to craft. This is the 90% case once a shell
+is up. Default line ending is `cr`; pass `--newline lf`/`crlf` if the device
+needs it.
 
-Add `--literal` to treat `<PROMPT_REGEX>` as a fixed string instead of a regex.
+### Raw / non-shell console → `run`
+
+Bootloader mid-boot, login prompt, vendor MCU monitor — anything without a
+shell to run `echo`/`$?`:
+
+```sh
+tether -d <id> --json run "<COMMAND>" --newline crlf -u "<PROMPT_REGEX>" --timeout-ms <T>
+```
+
+`run` is a single daemon-side transaction: it holds the writer lock, sends
+`<COMMAND>` plus the newline you choose, and waits for `<PROMPT_REGEX>` with a
+hard timeout — race-free, no interleaving from other clients. `--newline lf`
+for Unix endings, `--newline none` (default) if the command already contains
+its terminator. Add `--literal` to treat the pattern as a fixed string instead
+of a regex (prompts often contain `.`, `$`, `>`).
 
 ## Stable JSON fields
 
+`exec --json`:
+
+```jsonc
+{ "output": "...", "exit_code": 0, "duration_ms": 12, "truncated": false }
+```
+
+`run --json` / `expect --json`:
+
 ```jsonc
 {
-  "matched":      true,                  // bool — whether the prompt was found
-  "match":        "ASAD SOC => ",        // the matched substring
-  "output":       "...response text...", // UTF-8 decoded; ANSI/echo already stripped
-  "duration_ms":  404,                   // how long the run took
-  "truncated":    false,                 // true if `output` was capped
-  "original_bytes": 4622,                // pre-truncation length (when truncated)
-  "match_seq":    12450,                 // ring-buffer offset (debug only)
-  "end_seq":      12462,
-  "before":       "..."                  // base64 raw — prefer `output` instead
+  "matched":        true,                  // bool — whether the prompt was found
+  "match":          "ASAD SOC => ",        // the matched substring
+  "output":         "...response text...", // UTF-8 decoded; ANSI/echo already stripped
+  "duration_ms":    404,                   // how long the run took
+  "truncated":      false,                 // true if `output` was capped
+  "original_bytes": 4622,                  // pre-truncation length (when truncated)
+  "match_seq":      12450,                 // ring-buffer offset (debug only)
+  "end_seq":        12462,
+  "before":         "..."                  // base64 raw — prefer `output` instead
 }
 ```
 
@@ -62,16 +106,18 @@ non-UTF-8 boards).
  124 timeout                        (no match within --timeout-ms)
 ```
 
-Branch on these in shell scripts:
+`exec` additionally **passes through the device command's own exit status**
+(like ssh) — so a non-zero exit from `exec` usually means your *device* command
+failed, not tether. Branch on it directly:
 
 ```sh
-if tether --json run "ping" -u "$PROMPT" --newline crlf --timeout-ms 5000 > /tmp/r.json; then
-  echo "ok"; cat /tmp/r.json | jq .output
+if out=$(tether -d board0 exec "cat /proc/uptime" --json); then
+  echo "$out" | jq -r .output
 else
   case $? in
     124) echo "timeout — device alive but unresponsive";;
     4)   echo "device gone — abort";;
-    *)   echo "other failure — see stderr";;
+    *)   echo "device command failed (rc=$?)";;
   esac
 fi
 ```
@@ -80,104 +126,107 @@ Stderr always carries a one-line context message on failure (timeout, etc.).
 
 ## First-attach procedure
 
-When you first connect to an unfamiliar device, do this exact dance:
+When you first connect to an unfamiliar setup, do this exact dance:
 
 ```sh
-# 1. Confirm the daemon is alive and pointing at the right device.
-tether --json status | jq '{device: .device.path, baud: .device.baud, head: .buffer.head_seq}'
+# 1. What's connected? ids, paths, connected state.
+tether --json list-devices
 
-# 2. Detect the prompt. Sends a CR, waits for idle, returns the last non-empty line.
-PROMPT=$(tether sync --idle-ms 500 --timeout-ms 3000)
-echo "prompt: $PROMPT"
+# 2. Confirm the device + baud for the one you want.
+tether -d <id> --json status | jq '{path: .device.path, baud: .device.baud}'
 
-# 3. Use that exact string as the --until target (with --literal, since prompts
-#    often contain regex metacharacters like '.', '$', '>').
-tether --json run "version" --newline crlf -u "$PROMPT" --literal --timeout-ms 3000
+# 3. Is it at a shell? Just try exec.
+tether -d <id> exec "echo READY && id"
+
+# If exec times out or the device is a raw console, detect the prompt and use run:
+PROMPT=$(tether -d <id> sync --idle-ms 500 --timeout-ms 3000)
+tether -d <id> --json run "version" --newline crlf -u "$PROMPT" --literal --timeout-ms 3000
 ```
 
-Don't guess the prompt. Boards differ. `sync` is cheap.
+Don't guess the prompt for `run`. Boards differ. `sync` is cheap.
 
 ## Race-free patterns
 
-- **Always prefer `run` over `send` + `expect`.** `run` is a single transaction
-  that holds the writer lock, captures the seq before the write, and matches
-  starting from there. There is no race.
-- **Don't compose `send` + `expect` yourself unless you have a reason.** When
+- **For shells use `exec`; for raw consoles use `run`.** Both are single
+  transactions — `run` holds the writer lock, captures the seq before the write,
+  and matches from there; `exec` is built on the same primitive.
+- **Don't hand-compose `send` + `expect` unless you have a reason.** When
   multiple clients are attached (human + agent), interleaving bytes from
   separate sends can corrupt either client's matching.
-- **Set `--timeout-ms` explicitly every time.** Default is 3000ms. For boot,
-  flash, or memory dumps, raise it. Never pass `null`/0 expecting "wait
-  forever" — use a generous concrete bound like `60000`.
+- **Set `--timeout-ms` explicitly every time.** Default is 3000ms (`exec`:
+  5000ms). For boot, flash, or memory dumps, raise it. Never pass `null`/0
+  expecting "wait forever" — use a generous concrete bound like `60000`.
 
 ## Length safety
 
-- `--max-output-bytes 8192` is the default. If `truncated: true` you got the
-  *trailing* N bytes (since the prompt is at the end, you usually want this).
+- Default output cap is `--max-output-bytes 8192` for `run`/`expect`, `65536`
+  for `exec`. If `truncated: true` you got the *trailing* N bytes (the prompt /
+  end-marker is at the end, so you usually want this).
 - Set lower (e.g. `1024`) when you only care about pass/fail.
 - For commands that print megabytes (`md`, `ext4ls`, `cat /var/log/...`),
-  consider piping through paging or grep on the device side rather than
-  letting the host swallow it.
+  filter on the device side (`| tail`, `| grep`) rather than letting the host
+  swallow it.
 
 ## Common pitfalls
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| Timeout, no match | Forgot `--newline` | Add `--newline crlf` (or `lf`) |
-| Output begins with the command itself | `--strip-echo` got disabled | Re-enable (it's on by default) |
-| Match found in *previous* output | Used `expect` without anchoring | Use `run` instead |
-| Garbled / random bytes | Wrong baud rate | `tether status` shows the configured baud |
-| `output` empty, exit 0 | Pattern matched at offset 0 (empty before) | Add anchor like `^` or use `--literal` with full prompt |
-| Connection error | Daemon not running, or wrong `-s` socket | Check `ls /tmp/tetherd.sock` |
+| `-32015 ambiguous_device` | Multi-device daemon, no `-d` | Add `-d <id>` (`list-devices` to find it) |
+| Agent hangs on a menu | PTY + ambiguous target | Set `TETHER_NONINTERACTIVE=1` and pass `-d <id>` |
+| `run` times out, no match | Forgot `--newline` | Add `--newline crlf` (or `lf`) |
+| `exec` times out | Device isn't at a POSIX shell | Use `run`/`send`/`expect` for raw consoles |
+| Output begins with the command itself | `run --strip-echo` disabled | Re-enable (on by default); `exec` strips it always |
+| Match found in *previous* output | `expect` without anchoring | Use `run` (or `exec`) instead |
+| Garbled / random bytes | Wrong baud rate | `tether -d <id> status` shows the configured baud |
+| Connection error | Daemon not running, or wrong `-s` | Check `ls /tmp/tetherd.sock`; start a daemon |
 
 ## What NOT to do
 
-- **Don't use stdin streaming / interactive mode.** That's for humans. Every
-  command should be one `run` call with explicit pattern and timeout.
-- **Don't omit `--timeout-ms`.** A wrong default in your script will hang the
-  agent loop for 3 seconds × N retries.
-- **Don't strip the prompt manually from `output`.** It's already separated.
-  The prompt is in `match`, the response is in `output`.
+- **Don't use stdin streaming / interactive shell mode.** That's for humans.
+  Every command should be one `exec` (or `run`) call.
+- **Don't omit `-d <id>` on a multi-device daemon.** You'll get `-32015`, or —
+  under a PTY without `TETHER_NONINTERACTIVE` — an interactive menu that stalls.
+- **Don't omit `--timeout-ms`.** A wrong default will hang your loop.
+- **Don't strip the prompt/marker manually from `output`.** It's already
+  separated — `match` holds the prompt, `output` the response; `exec` returns
+  output only.
 - **Don't parse `--version` or human-readable output.** Always use `--json`.
-- **Don't open multiple writer-lock sessions in parallel.** If you need
-  concurrent reads (tail), do `tether tail` in one connection and `tether run`
-  in another. Don't try to send commands from two parallel `run`s racing.
+- **Don't open multiple writer-lock sessions in parallel.** For concurrent
+  reads, run `tether -d <id> tail` in one connection and `exec`/`run` in
+  another. Don't race two parallel `run`/`exec` writes.
 
 ## Connecting when a daemon may already be running
 
-If a human user (or a previous agent run) has a `tether shell` open against
-the device, **do not invoke `tether -D <PATH>` blindly**. Two daemons fighting
-for the same `/dev/ttyUSB0` will scramble the existing user's session.
-
-The CLI auto-detects this since v0.9.2: any `tether -D <PATH>` (or bare-path
-shorthand) probes `/tmp/tetherd*.sock` first, and if an existing daemon owns
-that path it attaches as a client to that daemon instead — printing a
-short "attaching as a client" notice on stderr. The existing session keeps
-running undisturbed.
-
-You can also check explicitly before doing anything destructive:
+The normal case: a long-lived `tetherd` is already up (someone ran it, or a
+human has a `tether shell` open). **Just attach as a client** — don't spawn a
+competing daemon for the same port.
 
 ```sh
-# 1. Is anyone home? (returns -32xxx with a clear message if not)
-tether --json status
+# Is anyone home? Either succeeding means a daemon is running.
+tether --json list-devices       # ids/paths it manages
+tether -d <id> --json status     # the device you care about
 
-# 2. List daemons / devices reachable from the default socket.
-tether --json list-devices
-
-# If either succeeds → a daemon is running, just attach as a client:
-tether --json run "<cmd>" -u "<prompt>" --literal --timeout-ms 5000
-
-# If both fail with -32003 connection error → no daemon, fine to spawn:
-tether -D /dev/ttyUSB0 --json run "..." -u "..." ...
+# Then drive it as a client (no daemon management on your side):
+tether -d <id> exec "<cmd>"
 ```
 
-Treat `tether -D` (and the `tether <PATH>` shorthand) as "lazy spawn —
-will reuse an existing daemon if one already manages this device." You
-do not need a separate `pgrep tetherd` check.
+Notes for automation:
+
+- **`tether -D <PATH>` / `tether <PATH>` are "lazy spawn".** They probe
+  `/tmp/tetherd*.sock` first; if an existing daemon already owns that path they
+  attach to it as a client (a short "attaching as a client" notice on stderr)
+  instead of starting a second daemon that would scramble the port. You don't
+  need a separate `pgrep tetherd` check.
+- **Bare `tether` with no daemon will, *in an interactive terminal*, offer a
+  port picker and start a throwaway session daemon.** Agents should not rely on
+  that: with `TETHER_NONINTERACTIVE=1` there's no prompt, so be explicit — start
+  a daemon (`tetherd -D /dev/ttyUSB0 -b 115200 &`) or use the standalone form
+  (`tether -D /dev/ttyUSB0 exec "..."`).
 
 ## Detecting what kind of device you're talking to
 
 ```sh
-PROMPT=$(tether sync --idle-ms 500)
+PROMPT=$(tether -d <id> sync --idle-ms 500)
 case "$PROMPT" in
   *"=> ")            echo "U-Boot or similar bootloader";;
   *"# ")             echo "root shell (busybox/Linux as root)";;
@@ -187,12 +236,13 @@ case "$PROMPT" in
 esac
 ```
 
-This is a starting heuristic, not gospel. Verify with `version`, `uname`, or
-whatever the board accepts.
+A starting heuristic, not gospel. Shells (`#`, `$`) → use `exec`; bootloaders /
+monitors (`=>`, `>`) → use `run`. Verify with `version`, `uname`, etc.
 
 ## Multiple boards on one host
 
-Two patterns supported. Both work.
+Two patterns. Prefer **B** (one daemon, many devices) — fewer moving parts and
+no port double-open.
 
 **A. One daemon per board** (`--name` selects which daemon):
 
@@ -201,51 +251,52 @@ tetherd -D /dev/ttyUSB0 --name board0 &
 tetherd -D /dev/ttyUSB1 --name board1 &
 
 tether --name board0 status
-tether --name board1 run "version" -u "# " --literal --newline crlf --timeout-ms 3000 --json
+tether --name board1 exec "uname -a"
 ```
 
 `--name X` is shorthand for `-s /tmp/tetherd-X.sock`.
 
-**B. One daemon, multiple devices** (`--device` / `-d` selects which
-device-in-daemon, since v0.8):
+**B. One daemon, multiple devices** (`-d` / `--device` selects which
+device-in-daemon):
 
 ```sh
-# Each -D is `[id=]path[,key=value,...]`. Per-device baud / parity /
-# data-bits / stop-bits / flow override the global flags.
+# Each -D is `[id=]path[,key=value,...]`. Per-device baud / parity / data-bits
+# / stop-bits / flow override the global flags.
 tetherd \
   -D 'board0=/dev/ttyUSB0' \
   -D 'board1=/dev/ttyUSB1,baud=921600' &
 
 # Address devices by id.
 tether -d board0 status
-tether -d board0 run "version" -u "# " --literal --newline crlf
+tether -d board0 exec "uname -a"
 tether -d board1 sync
 tether list-devices         # daemon-wide; no -d needed
 ```
 
-Multi-device daemons answer `-32015 ambiguous_device` if `--device`
-is missing and >1 device is managed. Single-device daemons fall back
-to the only device, so `--device` is optional in that case.
+Multi-device daemons answer `-32015 ambiguous_device` if `-d` is missing and
+>1 device is managed. Single-device daemons fall back to the only device, so
+`-d` is optional there.
 
-## Tio-style line / break / modem control (since v0.8)
+## Tio-style line / break / modem control
 
 ```sh
-tether break --duration-ms 250            # send a BREAK pulse
-tether dtr on                             # assert DTR
-tether dtr off                            # deassert
-tether rts on                             # assert RTS
-tether lines                              # → CTS=1 DSR=0 RI=0 DCD=1
-tether disconnect                         # explicit close (parks port)
-tether connect                            # release the hold, reopen
+tether -d <id> break --duration-ms 250    # send a BREAK pulse
+tether -d <id> dtr on                      # assert DTR
+tether -d <id> dtr off                     # deassert
+tether -d <id> rts on                      # assert RTS
+tether -d <id> lines                       # → CTS=1 DSR=0 RI=0 DCD=1
+tether -d <id> disconnect                  # explicit close (parks port)
+tether -d <id> connect                     # release the hold, reopen
+tether -d <id> config                      # show live baud/framing/flow
+tether -d <id> config --baud 921600        # change it live
 ```
 
-All take `--device` on multi-device daemons. The Fd backend (PTYs,
-pipes) returns `-32007 unsupported_serial_op` for break / dtr / rts /
-lines.
+The Fd backend (PTYs, pipes) returns `-32007 unsupported_serial_op` for
+break / dtr / rts / lines.
 
 ## Remote daemons (over a network)
 
-Native TCP transport with token auth (v0.4.0+; v0.5 lets you say just `--tcp`):
+Native TCP transport with token auth:
 
 ```sh
 # Daemon host (board operator):
@@ -254,61 +305,81 @@ tetherd -D /dev/tty.usbserial-XXXX --tcp --auth-token MYSECRET
 
 # Agent host (you):
 export TETHER_AUTH_TOKEN=MYSECRET
-tether -s tcp://daemon-host:5557 status
-tether -s tcp://daemon-host:5557 run "version" --newline crlf -u "# " --literal
+export TETHER_NONINTERACTIVE=1
+tether -s tcp://daemon-host:5557 -d <id> status
+tether -s tcp://daemon-host:5557 -d <id> exec "uname -a"
 ```
 
-UDS still works for local connections (OS-level auth via file permissions).
-A single daemon can listen on both transports at once.
+UDS still works for local connections (OS-level auth via file permissions). A
+single daemon can listen on both transports at once.
 
-If you're stuck with a pre-v0.4 daemon you cannot upgrade, fall back to SSH
+If you're stuck with a pre-TCP daemon you cannot upgrade, fall back to SSH
 forwarding the UDS:
 
 ```sh
-# Forward the remote socket onto your local filesystem (one-time per session).
 ssh -N -L /tmp/tetherd-remote.sock:/tmp/tetherd.sock user@daemon-host &
-tether -s /tmp/tetherd-remote.sock status
+tether -s /tmp/tetherd-remote.sock -d <id> status
 ```
 
 Don't waste effort on socat bridges; native TCP is simpler and the wire
 protocol is identical.
 
-## Worked example
+## Worked example A — Linux shell (use `exec`)
+
+Goal: read a value, act on it, check a file, all by exit code.
+
+```sh
+#!/usr/bin/env bash
+set -e
+D=board0
+
+tether -d $D exec "uname -a"
+UP=$(tether -d $D exec "cut -d. -f1 /proc/uptime" --json | jq -r .output)
+echo "uptime ${UP}s"
+
+if tether -d $D exec "test -e /dev/mmcblk1"; then
+  echo "eMMC present"
+else
+  echo "no eMMC — exit $?"
+fi
+```
+
+## Worked example B — U-Boot (raw console, use `run`)
 
 Goal: read U-Boot environment, set a variable, save it, verify.
 
 ```sh
 #!/usr/bin/env bash
 set -e
-PROMPT=$(tether sync --idle-ms 500 --timeout-ms 3000)
+D=board0
+PROMPT=$(tether -d $D sync --idle-ms 500 --timeout-ms 3000)
 
-run() {
-  tether --json run "$1" --newline crlf -u "$PROMPT" --literal --timeout-ms 5000 \
+ub() {
+  tether -d $D --json run "$1" --newline crlf -u "$PROMPT" --literal --timeout-ms 5000 \
     | jq -r .output
 }
 
-echo "--- before ---"
-run "printenv bootdelay"
-
-run "setenv bootdelay 5"
-run "saveenv"
-
-echo "--- after ---"
-run "printenv bootdelay"
+echo "--- before ---"; ub "printenv bootdelay"
+ub "setenv bootdelay 5"
+ub "saveenv"
+echo "--- after ---";  ub "printenv bootdelay"
 ```
 
-That's the shape of most board automation. `sync` once at the start, `run` per
-command with the same prompt, parse `output`.
+`sync` once at the start, `run` per command with the same prompt, parse `output`.
 
 ## Reference cheatsheet
 
 ```
-tether status                                                # daemon + device info
-tether sync --idle-ms 500                                    # detect prompt
-tether tail                                                  # stream output (read-only follow)
-tether send "any-bytes" --newline crlf                       # fire-and-forget
-tether run "<cmd>" -u "<prompt>" --literal --newline crlf    # canonical
-tether expect "<regex>" --timeout-ms <T>                     # rare; prefer run
+tether agents                                               # this guide, offline
+tether list-devices --json                                  # ids / paths / connected
+tether -d <id> status                                       # daemon + device info
+tether -d <id> exec "<cmd>"                                 # shell: output + exit code
+tether -d <id> exec "<cmd>" --json                          # {output, exit_code, duration_ms}
+tether -d <id> run "<cmd>" -u "<prompt>" --literal --newline crlf   # raw console
+tether -d <id> sync --idle-ms 500                           # detect prompt
+tether -d <id> tail                                         # stream output (read-only follow)
+tether -d <id> send "any-bytes" --newline crlf              # fire-and-forget
+tether -d <id> expect "<regex>" --timeout-ms <T>            # rare; prefer run/exec
 ```
 
-That's it. You're ready.
+Set `TETHER_NONINTERACTIVE=1` once in your environment. That's it. You're ready.
