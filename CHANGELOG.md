@@ -8,7 +8,36 @@ also apply.
 
 ## [Unreleased]
 
-(Nothing yet.)
+### Added
+- **Virtual serial port (PTY) so non-tether tools can share a device.** Add
+  `pty` (or `pty=/path`) to a `-D` spec and `tetherd` publishes a virtual serial
+  port — a stable symlink (`/tmp/tether-<id>.pty` by default) that minicom,
+  screen, pyserial, or a UART flasher can open like a real port. The daemon
+  bridges raw bytes both directions, and tether clients keep tailing/sending
+  concurrently — no second process fighting for `/dev/cu.*`.
+  ```sh
+  tetherd -D 'a35=/dev/cu.usbserial-XXXX,pty' -b 115200
+  # → virtual port: a35 -> /tmp/tether-a35.pty
+  screen /tmp/tether-a35.pty 115200
+  ```
+  **Carries data only.** A PTY has no modem lines or real line rate, so DTR/RTS
+  auto-reset and mid-stream baud changes can't pass through it (verified: macOS
+  PTYs return `ENOTTY` for all modem-control ioctls on both ends — an OS limit,
+  not fixable in software). Console sharing, and flashing where the board enters
+  download mode out-of-band (boot strap / button / command), work today. For
+  reset-based flashing use `tether reset` (below). Integration test
+  `pty_bridge_shares_port_both_directions`.
+- **`tether reset` — board reset for flashing through a shared port.** Since a
+  PTY can't carry DTR/RTS, drive the reset on the *real* port instead, then flash
+  with the tool's no-auto-reset option pointed at the virtual port:
+  ```sh
+  tether -d esp reset --esp32           # or --seq "dtr=0 rts=1 wait=100 dtr=1 rts=0 wait=50 dtr=0"
+  esptool --port /tmp/tether-esp.pty --before no_reset write_flash ...
+  ```
+  `--esp32` is the esptool "classic" sequence; `--seq` takes explicit steps
+  (`dtr=0|1`, `rts=0|1`, `wait=<ms>`) for other wirings. Built on the existing
+  `set_dtr`/`set_rts` RPCs — no daemon change, and it works while a `pty` bridge
+  is active (line control and data are independent). Unit-tested sequence parser.
 
 ## [0.10.0] — 2026-06-24
 

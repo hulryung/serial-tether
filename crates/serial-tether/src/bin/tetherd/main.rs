@@ -1,6 +1,7 @@
 mod buffer;
 mod conn;
 mod handlers;
+mod pty;
 mod serial;
 mod session;
 mod state;
@@ -81,6 +82,15 @@ struct Args {
     ///   `-D board0=/dev/ttyUSB0,baud=921600,parity=odd,data-bits=8,stop-bits=1,flow=none`
     ///   — per-device inline settings. Any setting omitted falls back to
     ///   the matching global flag (`--baud`, `--parity`, …).
+    ///
+    ///   `-D board0=/dev/ttyUSB0,pty` (or `pty=/path`) — also expose a virtual
+    ///   serial port so a non-tether tool (minicom/screen/pyserial/a UART
+    ///   flasher) can share this device. Bare `pty` links it at
+    ///   `/tmp/tether-<id>.pty`; `pty=/path` uses your path. Bytes bridge both
+    ///   ways and tether clients keep working concurrently. Note: a PTY has no
+    ///   modem lines or real baud, so DTR/RTS auto-reset and mid-stream baud
+    ///   changes are not forwarded (console sharing and out-of-band-reset
+    ///   flashing work).
     #[arg(
         short = 'D',
         long = "device",
@@ -189,6 +199,9 @@ struct DeviceSpec {
     parity: Option<String>,
     stop_bits: Option<u8>,
     flow_control: Option<String>,
+    /// `pty=<link>` exposes a virtual serial port for this device at `<link>`.
+    /// `Some("")` (bare `pty`) means "use the default path" (`/tmp/tether-<id>.pty`).
+    pty: Option<String>,
 }
 
 /// Parse one `-D` argument. Forms:
@@ -226,9 +239,15 @@ fn parse_device_spec(s: &str) -> anyhow::Result<DeviceSpec> {
         parity: None,
         stop_bits: None,
         flow_control: None,
+        pty: None,
     };
 
     for kv in parts {
+        // `pty` may appear bare (no value) → default link path.
+        if kv.trim() == "pty" {
+            spec.pty = Some(String::new());
+            continue;
+        }
         let (k, v) = kv
             .split_once('=')
             .ok_or_else(|| anyhow::anyhow!("expected key=value, got {kv:?} in -D spec"))?;
@@ -255,6 +274,7 @@ fn parse_device_spec(s: &str) -> anyhow::Result<DeviceSpec> {
             "flow" | "flow-control" | "flow_control" => {
                 spec.flow_control = Some(v.to_string());
             }
+            "pty" | "pty-link" => spec.pty = Some(v.to_string()),
             other => anyhow::bail!("unknown key {other:?} in -D spec {s:?}"),
         }
     }
@@ -551,6 +571,29 @@ async fn main() -> Result<()> {
             events: events_tx,
             lock: Arc::new(crate::state::WriterLock::default()),
         });
+
+        // Optional virtual serial port (PTY) so non-tether tools can share
+        // this device. A failure here is non-fatal — the daemon keeps serving.
+        if let Some(pty_link) = &spec.pty {
+            let link = if pty_link.is_empty() {
+                pty::default_link(&spec.id)
+            } else {
+                pty_link.clone()
+            };
+            match pty::spawn_pty_bridge(
+                spec.id.clone(),
+                link.clone(),
+                device.buffer.clone(),
+                device.writer.clone(),
+            ) {
+                Ok(()) => println!("virtual port: {} -> {}", spec.id, link),
+                Err(e) => tracing::warn!(
+                    device = %spec.id, error = %e,
+                    "could not start virtual pty; continuing without it"
+                ),
+            }
+        }
+
         devices_map.insert(spec.id.clone(), device);
     }
     let _serial_tasks = serial_tasks;

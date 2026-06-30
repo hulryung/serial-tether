@@ -410,6 +410,26 @@ enum Cmd {
     },
     /// Read the four input modem status lines (CTS / DSR / RI / DCD).
     Lines,
+    /// Reset the board by driving a DTR/RTS sequence on the *real* port.
+    ///
+    /// Use this for flashing through a shared/virtual port: a PTY can't carry
+    /// modem control, so a flashing tool's DTR/RTS auto-reset won't pass through
+    /// `pty=`. Run `reset` against the device to drive the reset here, then
+    /// flash with the tool's no-auto-reset option (e.g. esptool
+    /// `--before no_reset`) pointed at `/tmp/tether-<id>.pty`.
+    ///
+    /// Provide a preset (`--esp32`) or an explicit `--seq`. Line state `1` =
+    /// asserted, `0` = deasserted; `wait=<ms>` sleeps. Example (esptool classic):
+    ///   tether -d esp reset --seq "dtr=0 rts=1 wait=100 dtr=1 rts=0 wait=50 dtr=0"
+    Reset {
+        /// esptool "classic" auto-reset sequence (leaves the chip in download mode).
+        #[arg(long)]
+        esp32: bool,
+        /// Custom sequence: space/comma-separated steps `dtr=0|1`, `rts=0|1`,
+        /// `wait=<ms>`, executed in order on the real port.
+        #[arg(long)]
+        seq: Option<String>,
+    },
 
     // ──────── Lifecycle ────────
     /// Drop and reopen the serial device (kick a wedged bus).
@@ -1526,6 +1546,22 @@ where
             let v = call(&mut framed, &mut next_id, "read_modem_status", Value::Object(p)).await?;
             print_modem_status(&v, cli.json);
         }
+        Cmd::Reset { esp32, seq } => {
+            let spec = match (esp32, seq) {
+                (true, _) => "dtr=0 rts=1 wait=100 dtr=1 rts=0 wait=50 dtr=0".to_string(),
+                (false, Some(s)) => s,
+                (false, None) => {
+                    return Err(CliError::Connection(
+                        "tether reset: give a sequence — a preset (--esp32) or \
+                         --seq \"dtr=0 rts=1 wait=100 dtr=1 rts=0 wait=50 dtr=0\".\n\
+                         (Line state 1=asserted, 0=deasserted; wait=<ms>.)"
+                            .into(),
+                    ));
+                }
+            };
+            run_reset_sequence(&mut framed, &mut next_id, cli.device_id.as_deref(), &spec).await?;
+            eprintln!("tether: reset sequence complete");
+        }
         Cmd::Disconnect => {
             let mut p = serde_json::Map::new();
             if let Some(d) = &cli.device_id { p.insert("device_id".into(), json!(d)); }
@@ -1686,6 +1722,91 @@ where
             first
         }
     }
+}
+
+/// One step of a reset sequence.
+#[derive(Debug, Clone, PartialEq)]
+enum ResetStep {
+    /// Drive DTR (`true` = asserted).
+    Dtr(bool),
+    /// Drive RTS (`true` = asserted).
+    Rts(bool),
+    /// Sleep for N milliseconds.
+    Wait(u64),
+}
+
+/// Parse a reset spec into steps. Space/comma/tab separated: `dtr=0|1`,
+/// `rts=0|1` (1 = asserted), `wait=<ms>`. Pure (no I/O) so it's unit-testable.
+fn parse_reset_steps(spec: &str) -> Result<Vec<ResetStep>, String> {
+    let mut steps = Vec::new();
+    for step in spec.split([' ', ',', '\t', '\n']).filter(|s| !s.is_empty()) {
+        let (k, v) = step
+            .split_once('=')
+            .ok_or_else(|| format!("bad step {step:?} (want dtr=/rts=/wait=)"))?;
+        match k.trim() {
+            "wait" | "delay" | "sleep" | "ms" => {
+                let ms: u64 = v
+                    .trim()
+                    .parse()
+                    .map_err(|_| format!("bad wait value {v:?} in {step:?}"))?;
+                steps.push(ResetStep::Wait(ms));
+            }
+            line @ ("dtr" | "rts") => {
+                let on = match v.trim().to_ascii_lowercase().as_str() {
+                    "1" | "on" | "high" | "true" | "assert" | "asserted" => true,
+                    "0" | "off" | "low" | "false" | "deassert" | "deasserted" => false,
+                    _ => return Err(format!("bad line state {v:?} in {step:?} (want 0 or 1)")),
+                };
+                steps.push(if line == "dtr" {
+                    ResetStep::Dtr(on)
+                } else {
+                    ResetStep::Rts(on)
+                });
+            }
+            _ => return Err(format!("unknown step {step:?} (want dtr=/rts=/wait=)")),
+        }
+    }
+    if steps.is_empty() {
+        return Err("empty reset sequence".into());
+    }
+    Ok(steps)
+}
+
+/// Execute a reset sequence on the device's real port via the existing
+/// `set_dtr` / `set_rts` control RPCs — works even while a virtual `pty` is
+/// bridging data (line control and data are independent).
+async fn run_reset_sequence<S>(
+    framed: &mut Framed<S, NdjsonCodec>,
+    next_id: &mut i64,
+    device_id: Option<&str>,
+    spec: &str,
+) -> Result<(), CliError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let steps = parse_reset_steps(spec).map_err(|e| CliError::Connection(format!("tether reset: {e}")))?;
+    for step in steps {
+        let (method, on) = match step {
+            ResetStep::Wait(ms) => {
+                tokio::time::sleep(Duration::from_millis(ms)).await;
+                continue;
+            }
+            ResetStep::Dtr(on) => ("set_dtr", on),
+            ResetStep::Rts(on) => ("set_rts", on),
+        };
+        let mut p = serde_json::Map::new();
+        if let Some(d) = device_id {
+            p.insert("device_id".into(), json!(d));
+        }
+        p.insert("on".into(), json!(on));
+        call(framed, next_id, method, Value::Object(p)).await?;
+        let line = if method == "set_dtr" { "dtr" } else { "rts" };
+        eprintln!(
+            "tether: {line} {}",
+            if on { "asserted (1)" } else { "deasserted (0)" }
+        );
+    }
+    Ok(())
 }
 
 fn map_rpc_error(code: i32, msg: String) -> CliError {
@@ -2575,6 +2696,43 @@ mod tests {
             .map(|c| c.path)
             .collect();
         assert_eq!(paths, ["/dev/ttyUSB0", "/dev/ttyACM0"]);
+    }
+
+    #[test]
+    fn parse_reset_steps_esp32_preset() {
+        let steps = parse_reset_steps("dtr=0 rts=1 wait=100 dtr=1 rts=0 wait=50 dtr=0").unwrap();
+        assert_eq!(
+            steps,
+            vec![
+                ResetStep::Dtr(false),
+                ResetStep::Rts(true),
+                ResetStep::Wait(100),
+                ResetStep::Dtr(true),
+                ResetStep::Rts(false),
+                ResetStep::Wait(50),
+                ResetStep::Dtr(false),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_reset_steps_accepts_aliases_and_separators() {
+        // commas, on/off/high/low, and wait aliases all work.
+        let steps = parse_reset_steps("rts=on,delay=10,rts=off").unwrap();
+        assert_eq!(
+            steps,
+            vec![ResetStep::Rts(true), ResetStep::Wait(10), ResetStep::Rts(false)]
+        );
+        assert_eq!(parse_reset_steps("dtr=low").unwrap(), vec![ResetStep::Dtr(false)]);
+    }
+
+    #[test]
+    fn parse_reset_steps_rejects_garbage() {
+        assert!(parse_reset_steps("").is_err()); // empty
+        assert!(parse_reset_steps("dtr").is_err()); // no '='
+        assert!(parse_reset_steps("dtr=maybe").is_err()); // bad state
+        assert!(parse_reset_steps("wait=soon").is_err()); // bad ms
+        assert!(parse_reset_steps("cts=1").is_err()); // unknown line
     }
 
     #[test]

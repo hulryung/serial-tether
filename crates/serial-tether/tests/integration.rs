@@ -779,6 +779,96 @@ fn exec_mirrors_nonzero_exit_and_json_shape() {
     );
 }
 
+// ---------- raw tty helpers (for the PTY-bridge test) ----------
+
+fn open_raw_tty(path: &str) -> i32 {
+    use std::ffi::CString;
+    let c = CString::new(path).unwrap();
+    let fd = unsafe { libc::open(c.as_ptr(), libc::O_RDWR | libc::O_NOCTTY | libc::O_NONBLOCK) };
+    assert!(fd >= 0, "open {path}: {}", std::io::Error::last_os_error());
+    unsafe {
+        let mut t: libc::termios = std::mem::zeroed();
+        if libc::tcgetattr(fd, &mut t) == 0 {
+            libc::cfmakeraw(&mut t);
+            libc::tcsetattr(fd, libc::TCSANOW, &mut t);
+        }
+    }
+    fd
+}
+
+fn write_tty(fd: i32, mut data: &[u8]) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !data.is_empty() && Instant::now() < deadline {
+        let n = unsafe { libc::write(fd, data.as_ptr() as *const _, data.len()) };
+        if n > 0 {
+            data = &data[n as usize..];
+        } else {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+/// Read from `fd` until `needle` appears or `timeout` elapses.
+fn tty_sees(fd: i32, needle: &[u8], timeout: Duration) -> bool {
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 4096];
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        let n = unsafe { libc::read(fd, tmp.as_mut_ptr() as *mut _, tmp.len()) };
+        if n > 0 {
+            buf.extend_from_slice(&tmp[..n as usize]);
+            if buf.windows(needle.len()).any(|w| w == needle) {
+                return true;
+            }
+        } else {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    false
+}
+
+#[test]
+fn pty_bridge_shares_port_both_directions() {
+    // A non-tether tool opens the daemon's virtual port (`pty=<link>`) and
+    // exchanges bytes with the device in both directions, while the real
+    // device end is held by the test (a socat-backed fake board).
+    let pair = spawn_pty_pair();
+    let link = format!("/tmp/tether-it-pty-{}-{}.pty", std::process::id(), unique_id());
+    let d = spawn_daemon(&[format!("dev={},pty={}", pair.a, link)]);
+
+    // Wait for the daemon to publish the symlink.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !Path::new(&link).exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(Path::new(&link).exists(), "daemon should publish the pty symlink");
+
+    let tool = open_raw_tty(&link); // external serial tool on the virtual port
+    let board = open_raw_tty(&pair.b); // far end of the fake device
+    std::thread::sleep(Duration::from_millis(250));
+
+    // tool → device
+    write_tty(tool, b"PING-tool\n");
+    assert!(
+        tty_sees(board, b"PING-tool", Duration::from_secs(3)),
+        "bytes written to the virtual port should reach the device"
+    );
+
+    // device → tool
+    write_tty(board, b"PONG-dev\n");
+    assert!(
+        tty_sees(tool, b"PONG-dev", Duration::from_secs(3)),
+        "device output should reach the virtual port"
+    );
+
+    unsafe {
+        libc::close(tool);
+        libc::close(board);
+    }
+    let _ = std::fs::remove_file(&link);
+    drop(d);
+}
+
 #[test]
 fn ports_handler_returns_array() {
     // `tether ports` calls the daemon's list_ports RPC. Smoke-check it
