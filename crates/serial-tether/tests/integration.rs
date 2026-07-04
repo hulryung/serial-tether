@@ -189,6 +189,49 @@ fn spawn_daemon(specs: &[String]) -> Daemon {
     panic!("tetherd failed to bind {socket} within 5s");
 }
 
+/// Like `spawn_daemon`, but lowers the child's `RLIMIT_NOFILE` before exec so
+/// tests can cheaply force the daemon into fd exhaustion (EMFILE on
+/// `accept()`) without actually opening thousands of connections.
+fn spawn_daemon_with_fd_limit(specs: &[String], nofile: u64) -> Daemon {
+    use std::os::unix::process::CommandExt;
+
+    let socket = unique_socket();
+    let mut cmd = Command::new(TETHERD);
+    cmd.arg("-s").arg(&socket);
+    for spec in specs {
+        cmd.arg("-D").arg(spec);
+    }
+    match std::env::var("TETHERD_LOG").as_deref() {
+        Ok("stderr") => cmd.stdout(Stdio::null()).stderr(Stdio::inherit()),
+        _ => cmd.stdout(Stdio::null()).stderr(Stdio::null()),
+    };
+    // SAFETY: the closure only calls async-signal-safe `setrlimit` between
+    // fork and exec, and never touches the parent's memory beyond `nofile`.
+    unsafe {
+        cmd.pre_exec(move || {
+            let lim = libc::rlimit {
+                rlim_cur: nofile,
+                rlim_max: nofile,
+            };
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &lim) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let child = cmd.spawn().expect("spawn tetherd with lowered RLIMIT_NOFILE");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if Path::new(&socket).exists() {
+            std::thread::sleep(Duration::from_millis(80));
+            return Daemon { child, socket };
+        }
+        std::thread::sleep(Duration::from_millis(40));
+    }
+    panic!("tetherd failed to bind {socket} within 5s");
+}
+
 // ---------- tether CLI helpers ----------
 
 /// Run `tether -s <daemon> <args...> --json`, expect JSON-parseable stdout.
@@ -1373,4 +1416,49 @@ fn ports_handler_returns_array() {
     let d = spawn_daemon(&[pty.path.clone()]);
     let v = tether_json(&d, &["ports"]);
     assert!(v.get("ports").and_then(|p| p.as_array()).is_some());
+}
+
+#[test]
+fn survives_accept_error_under_fd_exhaustion() {
+    // Regression test for a silent-crash bug: the UDS/TCP accept loops used
+    // to treat *any* accept() error as fatal and `break`, which unwound
+    // `main()` and exited the whole daemon cleanly (no panic, no signal —
+    // just gone, socket file left behind) while every other live session
+    // was torn down with it. accept() can fail transiently under fd
+    // pressure (EMFILE/ENFILE) or from an aborted peer (ECONNABORTED)
+    // without the listener itself being broken.
+    //
+    // Here we lower the daemon's RLIMIT_NOFILE so a burst of connections
+    // reliably drives `accept()` into EMFILE, then confirm the daemon is
+    // still alive and answering RPCs afterward instead of having quietly
+    // exited.
+    use std::os::unix::net::UnixStream;
+
+    let pty = spawn_pty();
+    let d = spawn_daemon_with_fd_limit(std::slice::from_ref(&pty.path), 48);
+
+    // Open far more concurrent connections than the fd budget allows. Most
+    // of these will themselves fail to connect (that's fine and expected —
+    // we're pressuring the daemon's fd table, not asserting on the client
+    // side) — what matters is what happens to the daemon.
+    let mut conns: Vec<UnixStream> = Vec::new();
+    for _ in 0..200 {
+        if let Ok(s) = UnixStream::connect(&d.socket) {
+            conns.push(s);
+        }
+    }
+    // Give the daemon a moment to run its accept loop against the flood.
+    std::thread::sleep(Duration::from_millis(300));
+    drop(conns);
+
+    // The old code would have exited main() right here — before or during
+    // the flood — leaving the socket file behind but nothing listening on
+    // it. Confirm the daemon is still up and serving by round-tripping a
+    // real RPC.
+    let v = tether_json(&d, &["status"]);
+    assert_eq!(
+        v.get("device").and_then(|dv| dv.get("path")).and_then(|s| s.as_str()),
+        Some(pty.path.as_str()),
+        "daemon should still be alive and answering `status` after an fd-exhaustion accept() error, got: {v}"
+    );
 }

@@ -65,8 +65,8 @@ Two binaries plus a wire protocol:
   processes can attach to the same daemon at the same time.
 
 - **wire protocol** — JSON-RPC 2.0 framed as line-delimited JSON. Same
-  shape over UDS and TCP. Plain text for debuggability; the daemon's
-  `--log-protocol` dumps every message as NDJSON.
+  shape over UDS and TCP. Plain text for debuggability — you can watch or
+  speak it by hand with `socat`/`nc` (see PROTOCOL.md §11).
 
 ## The mental model
 

@@ -9,6 +9,7 @@ mod state;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -711,8 +712,17 @@ async fn main() -> Result<()> {
                         });
                     }
                     Err(e) => {
-                        tracing::error!(error=%e, "UDS accept error");
-                        break;
+                        // accept() can fail transiently (EMFILE/ENFILE under fd
+                        // pressure, ECONNABORTED from a peer that reset before
+                        // the handshake completed, ...) without the listener
+                        // itself being broken. Treating any single failure as
+                        // fatal used to tear down the whole daemon — including
+                        // every live session — with no crash report, just a
+                        // clean exit. Log and keep accepting instead; the brief
+                        // sleep avoids a tight spin loop if the condition is
+                        // sustained (e.g. fds stay exhausted).
+                        tracing::error!(error=%e, "UDS accept error; continuing");
+                        tokio::time::sleep(Duration::from_millis(50)).await;
                     }
                 }
             }
@@ -742,8 +752,10 @@ async fn main() -> Result<()> {
                         });
                     }
                     Err(e) => {
-                        tracing::error!(error=%e, "TCP accept error");
-                        break;
+                        // Same rationale as the UDS listener above: don't let a
+                        // transient accept() error kill the daemon.
+                        tracing::error!(error=%e, "TCP accept error; continuing");
+                        tokio::time::sleep(Duration::from_millis(50)).await;
                     }
                 }
             }
@@ -764,7 +776,9 @@ async fn main() -> Result<()> {
         auth_token.as_deref().map(String::as_str),
     );
 
-    // Wait for any listener task to exit (which means accept failed).
+    // Listener tasks now loop forever (accept errors are logged and
+    // retried, never fatal — see above), so this simply blocks main() for
+    // the life of the process; it returns only if a listener task panics.
     for h in listener_tasks {
         let _ = h.await;
     }

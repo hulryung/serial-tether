@@ -553,7 +553,8 @@ within a major.
 
 ## 11. Debugging
 
-- `tetherd --log-protocol <path>`: dumps every in/out message as `{ts, dir, conn_id, raw}` NDJSON.
+- Log level: `RUST_LOG=debug tetherd ...` (standard `tracing_subscriber`
+  filtering; tracing goes to stdout, the human startup banner to stderr).
 - Talk to the daemon by hand:
   - **UDS** — `socat - UNIX-CONNECT:/run/tetherd.sock` (or `nc -U` on Linux).
   - **TCP** — `nc daemon-host 5557` (don't forget to send a valid `auth_token` in the first `hello`).

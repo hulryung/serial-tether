@@ -93,6 +93,43 @@ also apply.
   is active (line control and data are independent). Unit-tested sequence parser.
 
 ### Fixed
+- **`tetherd` no longer exits silently when `accept()` fails.** A single
+  transient accept error (EMFILE under fd pressure, ECONNABORTED from a peer
+  resetting mid-handshake) used to end the listener task, which ended `main()`
+  — the whole daemon, including every live session, went down with exit 0, no
+  message, and a stale socket file left behind. Accept errors are now logged
+  and retried (with a short backoff). Regression test
+  `survives_accept_error_under_fd_exhaustion` lowers `RLIMIT_NOFILE` and
+  verifies the daemon keeps serving through 200 concurrent connections.
+- **`tether status` now honors `-d <id>`.** It used to always report the
+  daemon's default device regardless of `-d` (silently, even for nonexistent
+  ids) — which broke the documented `-d <id> --json status | jq .device.path`
+  recipe on multi-device daemons. With `-d`, the top-level
+  `device`/`buffer`/`lock`/`sessions` fields now describe the requested
+  device; unknown ids fail with the list of ids the daemon does have.
+- **Exit codes 5 and 6 are no longer silent.** Buffer overflow and lock
+  contention each print a one-line stderr explanation instead of exiting with
+  nothing on any stream.
+
+### Docs
+- **New user documentation suite**, organized easy → advanced:
+  `docs/GETTING_STARTED.md` (install → first session in ~10 minutes),
+  `docs/COOKBOOK.md` (16 task recipes from boot-log capture to flashing
+  through a shared port), `docs/CLI_REFERENCE.md` (every flag of both
+  binaries, generated against `--help`), `docs/TROUBLESHOOTING.md`
+  (symptom → cause → fix, exact error strings), and `docs/README.md`
+  (learning-path index). Command sequences were verified against the built
+  binaries (socat-backed fake devices, pyserial round trips).
+- **Documentation website** at https://hulryung.github.io/serial-tether/ —
+  VitePress rendering `docs/` in place (same files stay readable on GitHub),
+  with local full-text search, dark/light brand theme, and the asciinema
+  demos ported from the old hand-made landing page onto the new home page.
+  Deployed by `.github/workflows/docs.yml` on every push to `main` that
+  touches `docs/`.
+- `docs/AI_AGENT_GUIDE.md` refreshed to the current CLI (exec-first,
+  `tether agents` on-ramp, `TETHER_NONINTERACTIVE=1`); removed a ghost
+  `--log-protocol` flag from PROTOCOL.md/OVERVIEW.md that was never shipped.
+
 - **Daemon `pty=` bridge no longer wedges when no tool is reading.** The
   device→pty write could park forever once the tiny kernel pty buffer (~1KB on
   macOS) filled, freezing the ring cursor and replaying stale bytes to the next

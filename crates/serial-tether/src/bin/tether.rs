@@ -607,8 +607,21 @@ fn main() -> ExitCode {
         Err(CliError::RemoteExit(code)) => ExitCode::from(code),
         Err(CliError::Timeout(_)) => ExitCode::from(124),
         Err(CliError::DeviceDisconnected) => ExitCode::from(4),
-        Err(CliError::BufferOverflow) => ExitCode::from(5),
-        Err(CliError::LockContention) => ExitCode::from(6),
+        // 5/6 used to exit silently, which reads as "nothing happened" in a
+        // terminal. One line each so a human (or an agent's stderr capture)
+        // can tell why the command failed without memorising exit codes.
+        Err(CliError::BufferOverflow) => {
+            eprintln!(
+                "tether: buffer overflow — no match within the search window (1 MiB of output)"
+            );
+            ExitCode::from(5)
+        }
+        Err(CliError::LockContention) => {
+            eprintln!(
+                "tether: device is locked by another session (flashing?) — try again after it unlocks"
+            );
+            ExitCode::from(6)
+        }
         Err(CliError::Unauthorized(msg)) => {
             eprintln!("tether: unauthorized: {msg}");
             ExitCode::from(7)
@@ -1373,7 +1386,56 @@ where
 
     match cmd {
         Cmd::Status => {
-            let v = call(&mut framed, &mut next_id, "status", json!({})).await?;
+            let mut v = call(&mut framed, &mut next_id, "status", json!({})).await?;
+            // The status RPC is daemon-wide; `device`/`buffer` in the reply
+            // describe the *default* device. When the user targeted a device
+            // with `-d`, swap in that device's row so `-d board1 status`
+            // (and the documented `--json | jq .device.path` recipe) reports
+            // the device they asked about, not the default.
+            if let Some(want) = &cli.device_id {
+                let row = v
+                    .get("devices")
+                    .and_then(|a| a.as_array())
+                    .and_then(|arr| {
+                        arr.iter()
+                            .find(|d| d.get("id").and_then(|s| s.as_str()) == Some(want.as_str()))
+                    })
+                    .cloned();
+                match row {
+                    Some(row) => {
+                        if let Some(obj) = v.as_object_mut() {
+                            if let Some(dev) = row.get("device") {
+                                obj.insert("device".into(), dev.clone());
+                            }
+                            if let Some(buf) = row.get("buffer") {
+                                obj.insert("buffer".into(), buf.clone());
+                            }
+                            if let Some(lock) = row.get("lock") {
+                                obj.insert("lock".into(), lock.clone());
+                            }
+                            if let Some(sessions) = row.get("sessions") {
+                                obj.insert("sessions".into(), sessions.clone());
+                            }
+                        }
+                    }
+                    None => {
+                        let known: Vec<String> = v
+                            .get("devices")
+                            .and_then(|a| a.as_array())
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|d| d.get("id").and_then(|s| s.as_str()))
+                                    .map(String::from)
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        return Err(CliError::Protocol(format!(
+                            "device {want:?} not found (daemon has: {})",
+                            known.join(", ")
+                        )));
+                    }
+                }
+            }
             print_json_or_pairs(&v, cli.json);
         }
         Cmd::Send { data, base64: is_b64, newline } => {

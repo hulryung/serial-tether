@@ -1,0 +1,36 @@
+/**
+ * Brand palette — ported from the old docs/index.html landing page, whose
+ * accent was #f78166 (a warm orange, GitHub's "attention" hue). That value
+ * reads fine on the dark background it was designed for but falls short of
+ * WCAG AA (2.5:1) as body/link text on white, so light mode gets a darker,
+ * more saturated shade of the same hue instead of the literal hex.
+ */
+:root {
+  --vp-c-brand-1: #c1440e;
+  --vp-c-brand-2: #a63a0d;
+  --vp-c-brand-3: #d9643f;
+  --vp-c-brand-soft: rgba(247, 129, 102, 0.14);
+
+  --vp-home-hero-name-color: transparent;
+  --vp-home-hero-name-background: -webkit-linear-gradient(120deg, #c1440e 30%, #f78166);
+}
+
+.dark {
+  --vp-c-brand-1: #f78166;
+  --vp-c-brand-2: #ff9d82;
+  --vp-c-brand-3: #d9643f;
+  --vp-c-brand-soft: rgba(247, 129, 102, 0.16);
+
+  --vp-home-hero-name-background: -webkit-linear-gradient(120deg, #f78166 30%, #ffb199);
+}
+
+/* Buttons already derive from --vp-c-brand-*, this just nudges the primary
+   "Get Started" CTA to read closer to the old page's blue-accent button. */
+.VPButton.brand {
+  --vp-button-brand-border: var(--vp-c-brand-1);
+  --vp-button-brand-bg: var(--vp-c-brand-1);
+  --vp-button-brand-hover-border: var(--vp-c-brand-2);
+  --vp-button-brand-hover-bg: var(--vp-c-brand-2);
+  --vp-button-brand-active-border: var(--vp-c-brand-2);
+  --vp-button-brand-active-bg: var(--vp-c-brand-2);
+}
