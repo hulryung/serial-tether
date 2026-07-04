@@ -68,13 +68,55 @@ impl DeviceEventKind {
     }
 }
 
-/// Per-device writer lock used by `run` transactions.
-/// `holder == None` means the lock is free; `Some(id)` means session `id`
-/// owns it. Each `Device` has its own lock — concurrent transactions on
-/// different devices never serialise against each other.
+/// Static per-device console personality, set once from the `-D` spec and
+/// surfaced in `status` / `list_devices`. It never changes at runtime, so it
+/// lives outside the config mutex. Drives client-side behaviour: how `exec`
+/// frames commands and picks a line terminator, and the default `-u` prompt
+/// for `run` / `sync`.
+#[derive(Clone, Debug)]
+pub struct ConsolePersonality {
+    /// `"posix"` | `"uboot"` | `"none"`. Validated at `-D` parse time.
+    pub shell: String,
+    /// Default `-u` prompt regex for `run` / `sync`; `None` if unset.
+    pub prompt: Option<String>,
+    /// Default line terminator (`"lf"` | `"cr"` | `"crlf"` | `"none"`); `None`
+    /// if unset. `uboot` defaults this to `"cr"` unless overridden.
+    pub newline: Option<String>,
+}
+
+impl Default for ConsolePersonality {
+    fn default() -> Self {
+        Self {
+            shell: "posix".into(),
+            prompt: None,
+            newline: None,
+        }
+    }
+}
+
+/// A held writer lock: who holds it, and whether the hold is *exclusive*.
+///
+/// `run` takes a transient, non-exclusive hold for the duration of its
+/// send+expect transaction — this only serialises against other sessions'
+/// `run`/`lock` calls, matching pre-v0.11 behaviour so existing scripts that
+/// interleave `send` with a concurrent `run` don't regress. The explicit
+/// `lock` RPC takes an exclusive hold, which additionally gates plain `send`
+/// (see `send` in handlers.rs) — that's what makes `lock` safe to flash
+/// under.
+#[derive(Clone, Debug)]
+pub struct LockHold {
+    pub session_id: String,
+    pub exclusive: bool,
+}
+
+/// Per-device writer lock used by `run` transactions and the explicit
+/// `lock`/`unlock` RPCs.
+/// `holder == None` means the lock is free; `Some(hold)` means session
+/// `hold.session_id` owns it. Each `Device` has its own lock — concurrent
+/// transactions on different devices never serialise against each other.
 #[derive(Default)]
 pub struct WriterLock {
-    pub holder: Mutex<Option<String>>,
+    pub holder: Mutex<Option<LockHold>>,
     pub released: Notify,
 }
 
@@ -97,6 +139,8 @@ pub struct Device {
     pub reconnected: Arc<Notify>,
     pub events: broadcast::Sender<DeviceEvent>,
     pub lock: Arc<WriterLock>,
+    /// Console personality (shell/prompt/newline) from the `-D` spec. Static.
+    pub console: ConsolePersonality,
 }
 
 #[derive(Clone)]

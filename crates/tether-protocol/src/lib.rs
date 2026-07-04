@@ -12,10 +12,11 @@ pub use message::{
     AckResult, AttachParams, AttachResult, BufferInfo, CancelParams, CancelResult, ClientInfo,
     ConnectDeviceResult, DataNotify, DetachParams, DeviceInfo, DeviceNotify, DeviceStatus,
     DeviceSummary, DeviceTarget, DisconnectDeviceResult, ExpectMatch, ExpectParams, ExpectResult,
-    HelloParams, HelloResult, LagNotify, ListDevicesResult, ListPortsResult, LockNotify, Message,
-    Notification, PortInfo, ReadModemStatusResult, ReconnectParams, ReconnectResult, Request,
-    Response, RunParams, RunResult, SendBreakParams, SendParams, SendResult, SessionInfo,
-    SessionNotify, SetDeviceParams, SetDeviceResult, SetLineParams, StatusResult, UntilSpec,
+    HelloParams, HelloResult, LagNotify, ListDevicesResult, ListPortsResult, LockNotify,
+    LockParams, LockResult, Message, Notification, PortInfo, ReadModemStatusResult,
+    ReconnectParams, ReconnectResult, Request, Response, RunParams, RunResult, SendBreakParams,
+    SendParams, SendResult, SessionInfo, SessionNotify, SetDeviceParams, SetDeviceResult,
+    SetLineParams, StatusResult, UnlockParams, UnlockResult, UntilSpec,
 };
 
 pub const PROTOCOL_VERSION: &str = "1";

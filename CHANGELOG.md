@@ -9,6 +9,59 @@ also apply.
 ## [Unreleased]
 
 ### Added
+- **Per-device console personality (`shell=` / `prompt=` / `newline=`).**
+  Register what's on the other end of the wire once, in the `-D` spec:
+  ```sh
+  tetherd -D 'board=/dev/ttyUSB0,shell=uboot,prompt==> '
+  # shell=posix|uboot|none (default posix); prompt=<regex>; newline=lf|cr|crlf|none
+  ```
+  `shell=uboot` forces CR-only framing for `exec`/`run` (CRLF double-executes
+  U-Boot's CLI) and defaults `newline=cr`; `shell=none` makes `exec` refuse
+  immediately with the raw-console recipe instead of timing out; `prompt=`
+  becomes the default `-u` for `run`/`sync`. The fields are reported in
+  `list_devices` / `status` / `hello`.
+- **`exec` now runs on U-Boot (hush) and reports honest exit codes.** The
+  wrapper is a single line with no temp variable, so it works unchanged on
+  POSIX shells and hush-enabled U-Boot. When the console can't report a numeric
+  status (non-POSIX monitor), `exec` still returns the captured output but
+  reports the status as *unknown*: `exit_code: null` in `--json` and process
+  exit **8** (new exit code) — it never fabricates a `0`. Details in
+  `docs/EXEC_NONPOSIX_SHELLS.md`.
+- **`tether pty` — on-demand virtual serial ports, one per tool.** Each
+  invocation creates a client-side PTY bridged to the device over the normal
+  protocol, with its own session cursor — so every tool gets a **full copy** of
+  the stream (two tools must never share one port: simultaneous readers split
+  the bytes between them, measured 128/72 of 200). Because the PTY is created
+  client-side, it works over TCP: a board on a lab host becomes a local port on
+  your laptop.
+  ```sh
+  tether -d a35 pty -- minicom -D {}     # port lives as long as minicom; {}=path, $TETHER_PTY set,
+                                         # child's exit code passes through
+  tether -d a35 pty --link /tmp/a35.pty  # or: print path on stdout (after ready, flushed), Ctrl-C to stop
+  tether -d a35 pty --read-only          # observation-only (typed bytes dropped, counted on stderr)
+  tether -d a35 pty --lock -- flasher {} # exclusive writer (see lock/unlock below)
+  ```
+  Safety details: links are claimed atomically (`symlink(2)`, EEXIST → next
+  slot) with a `<link>.pid` sidecar so stale links from killed clients are
+  detected and reclaimed instead of pointing at a recycled pty; SIGINT/SIGTERM
+  and all error paths remove the link; the bridge re-asserts raw mode if a tool
+  flips the slave into cooked/echo mode (prevents echo storms and CR/LF
+  munging); master writes are timeout-bounded so a stopped tool can't wedge the
+  bridge (dropped bytes are counted and reported). Startup order is a contract
+  for CI: pty → link → attach → (lock) → path printed+flushed → bridge.
+  Integration tests `client_pty_bridges_and_cleans_up_on_sigterm`,
+  `client_pty_lock_blocks_other_writers`; unit tests for link allocation,
+  `{}` substitution, and sidecar staleness.
+- **`lock` / `unlock` RPCs — real exclusive write for flashing.** `tether pty
+  --lock` (or the RPCs directly) takes a session-held *exclusive* writer lock:
+  while held, `send` from any other session fails with `-32004 lock_contention`
+  and the daemon-side `pty=` bridge drops non-tether tool bytes instead of
+  interleaving them into the flash stream. `run`'s internal transactional hold
+  is unchanged (non-exclusive) so existing behavior doesn't regress. The lock
+  releases on `unlock`, session detach, or connection teardown — a crashed
+  flashing client can't strand the device locked. Documented in PROTOCOL.md
+  §6.14; covered by `tests/lock.rs` and 15 new lock-state unit tests.
+
 - **Virtual serial port (PTY) so non-tether tools can share a device.** Add
   `pty` (or `pty=/path`) to a `-D` spec and `tetherd` publishes a virtual serial
   port — a stable symlink (`/tmp/tether-<id>.pty` by default) that minicom,
@@ -38,6 +91,14 @@ also apply.
   (`dtr=0|1`, `rts=0|1`, `wait=<ms>`) for other wirings. Built on the existing
   `set_dtr`/`set_rts` RPCs — no daemon change, and it works while a `pty` bridge
   is active (line control and data are independent). Unit-tested sequence parser.
+
+### Fixed
+- **Daemon `pty=` bridge no longer wedges when no tool is reading.** The
+  device→pty write could park forever once the tiny kernel pty buffer (~1KB on
+  macOS) filled, freezing the ring cursor and replaying stale bytes to the next
+  tool. Writes are now timeout-bounded (200ms): on timeout the chunk is dropped
+  (never retried — a cancelled write may have delivered a prefix, and retrying
+  would duplicate it), counted, and reported via a rate-limited warning.
 
 ## [0.10.0] — 2026-06-24
 

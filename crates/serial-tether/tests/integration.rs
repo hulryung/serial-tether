@@ -211,6 +211,14 @@ fn tether_json(d: &Daemon, args: &[&str]) -> serde_json::Value {
 
 /// Run `tether -s <daemon> <args...>`. Returns (exit_code, stdout, stderr).
 fn tether_exit(d: &Daemon, args: &[&str]) -> (i32, String, String) {
+    let (code, stdout, stderr, _elapsed) = tether_exit_timed(d, args);
+    (code, stdout, stderr)
+}
+
+/// Like `tether_exit`, but also reports how long the invocation took — used to
+/// assert that failures return promptly instead of hanging until a timeout.
+fn tether_exit_timed(d: &Daemon, args: &[&str]) -> (i32, String, String, Duration) {
+    let start = Instant::now();
     let output = Command::new(TETHER)
         .arg("-s")
         .arg(&d.socket)
@@ -221,6 +229,7 @@ fn tether_exit(d: &Daemon, args: &[&str]) -> (i32, String, String) {
         output.status.code().unwrap_or(-1),
         String::from_utf8_lossy(&output.stdout).to_string(),
         String::from_utf8_lossy(&output.stderr).to_string(),
+        start.elapsed(),
     )
 }
 
@@ -736,6 +745,178 @@ fn spawn_fake_shell(path: &str) {
     });
 }
 
+/// Parse an `echo "..."`-style segment, returning its argument with shell
+/// double-quotes removed (so `"BE""G"` concatenates to `BEG`, matching hush).
+/// `None` if the segment isn't an `echo`.
+fn parse_echo(seg: &str) -> Option<String> {
+    if seg == "echo" {
+        return Some(String::new());
+    }
+    let rest = seg.strip_prefix("echo ")?;
+    Some(rest.trim().replace('"', ""))
+}
+
+/// True if the segment is a bare `name=value` assignment (a valid identifier
+/// before `=`). U-Boot hush has no standalone assignment, so it treats these
+/// as commands — the exact trap that broke the old `__trc=$?` wrapper.
+fn is_assignment(seg: &str) -> bool {
+    match seg.split_once('=') {
+        Some((name, _)) => {
+            !name.is_empty()
+                && name
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        }
+        None => false,
+    }
+}
+
+/// Evaluate one hush-style command line (segments split on `;`), returning the
+/// wire output and the resulting `$?`. Models the three behaviours that matter:
+/// `$?` is expanded (using the status *before* each segment runs), bare
+/// assignments are `Unknown command`, and undefined `$vars` stay literal.
+fn uboot_eval(line: &str, start_status: i64) -> (String, i64) {
+    let mut out = String::new();
+    let mut status = start_status;
+    for seg in line.split(';') {
+        let seg = seg.trim();
+        if seg.is_empty() {
+            continue;
+        }
+        // Only `$?` is expanded; any other `$var` is left literal (like hush).
+        let expanded = seg.replace("$?", &status.to_string());
+        if let Some(arg) = parse_echo(&expanded) {
+            out.push_str(&arg);
+            out.push_str("\r\n");
+            status = 0;
+        } else if is_assignment(&expanded) {
+            out.push_str(&format!("Unknown command '{expanded}' - try 'help'\r\n"));
+            status = 1;
+        } else {
+            // Any other command: canned output, nonzero iff it mentions FAIL.
+            out.push_str("tether-exec-output\r\n");
+            status = if seg.contains("FAIL") { 7 } else { 0 };
+        }
+    }
+    (out, status)
+}
+
+/// Spawn a crude U-Boot *hush* emulator on the far PTY end. Models the traps
+/// from docs/EXEC_NONPOSIX_SHELLS.md so `tether exec`/`run` can be exercised
+/// against a non-POSIX console:
+///   - expands `$?` (hush does), so the unified wrapper reports a numeric status;
+///   - treats a bare `name=value` as `Unknown command` (this broke `__trc=$?`);
+///   - leaves an undefined `$var` literal in echo output;
+///   - repeats the previous command line on an *empty* line (the CRLF
+///     double-execution trap: CR runs the line, the trailing LF repeats it).
+///
+/// Every executed line is preceded on the wire by `UEXEC<n>` (a monotonic
+/// execution counter) so tests can count executions, and followed by a `=> `
+/// prompt so `run` has something to match.
+fn spawn_fake_uboot(path: &str) {
+    use std::io::{Read, Write};
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .expect("open far pty end for fake u-boot");
+    std::thread::spawn(move || {
+        let mut f = f;
+        let mut buf = [0u8; 4096];
+        let mut line: Vec<u8> = Vec::new();
+        let mut last_status: i64 = 0;
+        let mut last_line = String::new();
+        let mut exec_count: u64 = 0;
+        loop {
+            let n = match f.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            for &b in &buf[..n] {
+                if b == b'\r' || b == b'\n' {
+                    let raw = String::from_utf8_lossy(&line).to_string();
+                    line.clear();
+                    // Empty line → repeat the previous command (U-Boot CLI).
+                    let cmd_line = if raw.trim().is_empty() {
+                        if last_line.is_empty() {
+                            continue;
+                        }
+                        last_line.clone()
+                    } else {
+                        last_line = raw.clone();
+                        raw
+                    };
+                    exec_count += 1;
+                    let mut out = format!("UEXEC{exec_count}\r\n");
+                    // Terminal echo of the submitted line.
+                    out.push_str(&cmd_line);
+                    out.push_str("\r\n");
+                    let (eval, status) = uboot_eval(&cmd_line, last_status);
+                    out.push_str(&eval);
+                    last_status = status;
+                    // A prompt, no trailing newline, like a real console.
+                    out.push_str("=> ");
+                    let _ = f.write_all(out.as_bytes());
+                    let _ = f.flush();
+                } else {
+                    line.push(b);
+                }
+            }
+        }
+    });
+}
+
+/// Spawn a shell emulator that runs commands but never expands `$?` — it echoes
+/// the end marker with a *literal* `$?` (`TETHEREXECEND<tag>=$?`). Used to prove
+/// the client reports an unknown status (exit_code null / exit 8) promptly
+/// instead of hanging until the timeout.
+fn spawn_fake_no_status(path: &str) {
+    use std::io::{Read, Write};
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .expect("open far pty end for fake no-status shell");
+    std::thread::spawn(move || {
+        let mut f = f;
+        let mut buf = [0u8; 4096];
+        let mut line: Vec<u8> = Vec::new();
+        loop {
+            let n = match f.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            for &b in &buf[..n] {
+                if b == b'\r' || b == b'\n' {
+                    if line.is_empty() {
+                        continue;
+                    }
+                    let cmd = String::from_utf8_lossy(&line).to_string();
+                    line.clear();
+                    let mut out = format!("{cmd}\r\n");
+                    let needle = "TETHEREXECBE\"\"G";
+                    if let Some(idx) = cmd.find(needle) {
+                        let after = &cmd[idx + needle.len()..];
+                        if after.len() >= 12 {
+                            let tag = &after[..12];
+                            out.push_str(&format!("TETHEREXECBEG{tag}\r\n"));
+                            out.push_str("tether-exec-output\r\n");
+                            // Literal `$?` — the shell didn't expand it.
+                            out.push_str(&format!("TETHEREXECEND{tag}=$?\r\n"));
+                        }
+                    }
+                    let _ = f.write_all(out.as_bytes());
+                    let _ = f.flush();
+                } else {
+                    line.push(b);
+                }
+            }
+        }
+    });
+}
+
 #[test]
 fn exec_captures_output_and_zero_exit() {
     // `tether exec` should run a command on the (emulated) device shell, print
@@ -777,6 +958,194 @@ fn exec_mirrors_nonzero_exit_and_json_shape() {
             .contains("tether-exec-output"),
         "exec --json should include decoded output, got: {v}"
     );
+}
+
+#[test]
+fn exec_unified_wrapper_works_on_uboot() {
+    // The unified wrapper (no `__trc=$?`) runs on a hush-style U-Boot console
+    // and reports a numeric status, because `$?` is expanded inside the echo.
+    let pair = spawn_pty_pair();
+    spawn_fake_uboot(&pair.b);
+    let d = spawn_daemon(&[format!("ub={},shell=uboot,prompt==> ", pair.a)]);
+
+    let (code, stdout, stderr) = tether_exit(&d, &["-d", "ub", "exec", "echo hi"]);
+    assert_eq!(code, 0, "exec should exit 0 on hush U-Boot\nstderr:\n{stderr}");
+    assert!(
+        stdout.contains("hi"),
+        "exec stdout should carry the command output, got:\n{stdout}"
+    );
+    // No scaffolding leaks, and crucially no `__trc` (dropped by the unify fix).
+    assert!(
+        !stdout.contains("TETHEREXEC") && !stdout.contains("__trc"),
+        "exec stdout leaked marker/scaffolding:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("Unknown command"),
+        "the unified wrapper must not trip U-Boot's `Unknown command`:\n{stdout}"
+    );
+}
+
+#[test]
+fn exec_mirrors_status_on_uboot() {
+    // Status passthrough works on U-Boot too: `$?` expands to the command's
+    // real exit code, and --json exposes it as a number (never null here).
+    let pair = spawn_pty_pair();
+    spawn_fake_uboot(&pair.b);
+    let d = spawn_daemon(&[format!("ub={},shell=uboot", pair.a)]);
+
+    let (code, _out, stderr) = tether_exit(&d, &["-d", "ub", "exec", "do FAIL"]);
+    assert_eq!(code, 7, "exec should mirror the device status\nstderr:\n{stderr}");
+
+    let v = tether_json(&d, &["-d", "ub", "exec", "runit"]);
+    assert_eq!(
+        v.get("exit_code").and_then(|n| n.as_u64()),
+        Some(0),
+        "hush expands $? to a numeric status: {v}"
+    );
+}
+
+#[test]
+fn exec_unknown_status_is_null_and_fast() {
+    // A shell that leaves `$?` literal yields exit_code:null (never a fabricated
+    // 0) and exits 8 — and does so promptly, without waiting for the timeout.
+    let pair = spawn_pty_pair();
+    spawn_fake_no_status(&pair.b);
+    let d = spawn_daemon(std::slice::from_ref(&pair.a));
+
+    let (code, stdout, stderr, elapsed) =
+        tether_exit_timed(&d, &["exec", "somecmd", "--timeout-ms", "8000"]);
+    assert_eq!(
+        code, 8,
+        "unparsable status should exit 8 (unknown), not 0\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("tether-exec-output"),
+        "output must still be captured for an unknown status:\n{stdout}"
+    );
+    assert!(
+        stderr.contains("EXEC_NONPOSIX_SHELLS.md"),
+        "stderr should point at the non-POSIX guide, got:\n{stderr}"
+    );
+    // The end marker matched immediately; we must not have waited out 8s.
+    assert!(
+        elapsed < Duration::from_secs(4),
+        "unknown status should be reported promptly, took {elapsed:?}"
+    );
+
+    // --json exposes exit_code: null (JSON null, not the integer 0).
+    let v = tether_json(&d, &["exec", "somecmd"]);
+    assert!(
+        v.get("exit_code").map(|c| c.is_null()).unwrap_or(false),
+        "exit_code must be null for an unparsable status, got: {v}"
+    );
+}
+
+#[test]
+fn exec_shell_none_refuses_immediately() {
+    // A device declared shell=none is a raw console: exec must refuse at once
+    // with the run/send/expect hint, never hang until the timeout.
+    let pty = spawn_pty();
+    let d = spawn_daemon(&[format!("raw={},shell=none", pty.path)]);
+
+    let (code, _out, stderr, elapsed) =
+        tether_exit_timed(&d, &["-d", "raw", "exec", "anything", "--timeout-ms", "8000"]);
+    assert_eq!(code, 3, "shell=none exec should be a connection-class refusal (3)\nstderr:\n{stderr}");
+    assert!(
+        stderr.contains("shell=none") && stderr.contains("run"),
+        "refusal should name shell=none and point at run/send/expect, got:\n{stderr}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "shell=none refusal must be immediate, took {elapsed:?}"
+    );
+}
+
+#[test]
+fn list_devices_reports_console_personality() {
+    // The console personality flows daemon-side and is visible in list-devices.
+    let pty = spawn_pty();
+    let d = spawn_daemon(&[format!("ub={},shell=uboot,prompt==> ", pty.path)]);
+
+    let v = tether_json(&d, &["list-devices"]);
+    let dev = v
+        .get("devices")
+        .and_then(|a| a.as_array())
+        .and_then(|a| a.first())
+        .expect("one device");
+    assert_eq!(dev.get("shell").and_then(|s| s.as_str()), Some("uboot"));
+    assert_eq!(dev.get("prompt").and_then(|s| s.as_str()), Some("=> "));
+    // shell=uboot defaults the line terminator to cr.
+    assert_eq!(dev.get("newline").and_then(|s| s.as_str()), Some("cr"));
+}
+
+#[test]
+fn run_defaults_until_and_newline_from_device_prompt() {
+    // With a device `prompt=`, `run` needs no -u; and shell=uboot supplies the
+    // cr line terminator so the command actually submits.
+    let pair = spawn_pty_pair();
+    spawn_fake_uboot(&pair.b);
+    let d = spawn_daemon(&[format!("ub={},shell=uboot,prompt==> ", pair.a)]);
+
+    let (code, stdout, stderr) = tether_exit(&d, &["-d", "ub", "run", "mdio"]);
+    assert_eq!(
+        code, 0,
+        "run should default -u to the device prompt and match it\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("tether-exec-output"),
+        "run should capture the command output, got:\n{stdout}"
+    );
+}
+
+#[test]
+fn run_without_until_or_prompt_errors() {
+    // No -u and no device prompt → a helpful usage error, not a hang.
+    let pty = spawn_pty();
+    let d = spawn_daemon(std::slice::from_ref(&pty.path));
+
+    let (code, _out, stderr, elapsed) =
+        tether_exit_timed(&d, &["run", "something", "--timeout-ms", "8000"]);
+    assert_eq!(code, 3, "missing -u with no prompt= should be a usage/connection error\nstderr:\n{stderr}");
+    assert!(
+        stderr.contains("--until") || stderr.contains("-u"),
+        "error should ask for -u/--until, got:\n{stderr}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "should fail fast, took {elapsed:?}"
+    );
+}
+
+#[test]
+fn uboot_crlf_double_executes() {
+    // Regression: CRLF toward U-Boot runs each command twice (CR runs it, the
+    // trailing LF repeats it). The mock models this, so `run --newline crlf`
+    // sees the *second* execution's counter.
+    let pair = spawn_pty_pair();
+    spawn_fake_uboot(&pair.b);
+    let d = spawn_daemon(&[format!("ub={},shell=uboot", pair.a)]);
+
+    let (code, _out, stderr) = tether_exit(&d, &[
+        "-d", "ub", "run", "probe", "-u", "UEXEC2", "--newline", "crlf", "--timeout-ms", "3000",
+    ]);
+    assert_eq!(
+        code, 0,
+        "crlf must double-execute (UEXEC2 should appear)\nstderr:\n{stderr}"
+    );
+}
+
+#[test]
+fn uboot_cr_executes_once() {
+    // The flip side: CR-only runs each command exactly once, so a second
+    // execution (UEXEC2) never appears and `run` times out (124).
+    let pair = spawn_pty_pair();
+    spawn_fake_uboot(&pair.b);
+    let d = spawn_daemon(&[format!("ub={},shell=uboot", pair.a)]);
+
+    let (code, _out, _stderr) = tether_exit(&d, &[
+        "-d", "ub", "run", "probe", "-u", "UEXEC2", "--newline", "cr", "--timeout-ms", "1500",
+    ]);
+    assert_eq!(code, 124, "cr must execute exactly once (no UEXEC2 → timeout)");
 }
 
 // ---------- raw tty helpers (for the PTY-bridge test) ----------
@@ -865,6 +1234,132 @@ fn pty_bridge_shares_port_both_directions() {
         libc::close(tool);
         libc::close(board);
     }
+    let _ = std::fs::remove_file(&link);
+    drop(d);
+}
+
+#[test]
+fn client_pty_bridges_and_cleans_up_on_sigterm() {
+    // `tether pty --link <path>` (the on-demand client-side virtual port):
+    // prints the path on stdout once ready, bridges bytes both directions,
+    // and removes the symlink + pid sidecar when terminated.
+    use std::io::Read as _;
+
+    let pair = spawn_pty_pair();
+    let d = spawn_daemon(&[format!("dev={}", pair.a)]);
+    let link = format!(
+        "/tmp/tether-it-cpty-{}-{}.pty",
+        std::process::id(),
+        unique_id()
+    );
+
+    let mut client = Command::new(TETHER)
+        .args(["-s", &d.socket, "-d", "dev", "pty", "--link", &link])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn tether pty");
+
+    // Readiness contract: the link path arrives on stdout (one line, flushed)
+    // only after the pty exists, the link is claimed, and the session is
+    // attached — so reading it is the CI-safe "port is usable" signal.
+    let mut stdout = client.stdout.take().expect("piped stdout");
+    let path_line = {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let mut byte = [0u8; 1];
+            while let Ok(1) = stdout.read(&mut byte) {
+                if byte[0] == b'\n' {
+                    break;
+                }
+                buf.push(byte[0]);
+            }
+            let _ = tx.send(String::from_utf8_lossy(&buf).into_owned());
+        });
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("tether pty should print the link path within 5s")
+    };
+    assert_eq!(path_line, link, "stdout should carry exactly the link path");
+    assert!(Path::new(&link).exists(), "link should exist at readiness");
+
+    let tool = open_raw_tty(&link); // external serial tool on the virtual port
+    let board = open_raw_tty(&pair.b); // far end of the fake device
+    std::thread::sleep(Duration::from_millis(250));
+
+    write_tty(tool, b"PING-client-pty\n");
+    assert!(
+        tty_sees(board, b"PING-client-pty", Duration::from_secs(3)),
+        "tool bytes should reach the device through the client bridge"
+    );
+    write_tty(board, b"PONG-to-client\n");
+    assert!(
+        tty_sees(tool, b"PONG-to-client", Duration::from_secs(3)),
+        "device bytes should reach the tool through the client bridge"
+    );
+
+    unsafe {
+        libc::close(tool);
+        libc::close(board);
+    }
+
+    // SIGTERM must remove the link and its pid sidecar (PtyLinkGuard).
+    unsafe { libc::kill(client.id() as i32, libc::SIGTERM) };
+    let _ = client.wait();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Path::new(&link).exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(!Path::new(&link).exists(), "SIGTERM should remove the link");
+    assert!(
+        !Path::new(&format!("{link}.pid")).exists(),
+        "SIGTERM should remove the pid sidecar"
+    );
+    drop(d);
+}
+
+#[test]
+fn client_pty_lock_blocks_other_writers() {
+    // `tether pty --lock` holds the exclusive writer lock: another client's
+    // `send` fails with lock contention (exit 6) while the pty runs, and
+    // succeeds again once it exits (teardown releases the lock).
+    let pair = spawn_pty_pair();
+    let d = spawn_daemon(&[format!("dev={}", pair.a)]);
+    let link = format!(
+        "/tmp/tether-it-lpty-{}-{}.pty",
+        std::process::id(),
+        unique_id()
+    );
+
+    let mut client = Command::new(TETHER)
+        .args(["-s", &d.socket, "-d", "dev", "pty", "--link", &link, "--lock"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn tether pty --lock");
+
+    // Wait for readiness via the link appearing, then a beat for the lock RPC.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !Path::new(&link).exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    std::thread::sleep(Duration::from_millis(600));
+
+    let (code, _out, err) = tether_exit(&d, &["-d", "dev", "send", "intrude", "--newline", "lf"]);
+    assert_eq!(
+        code, 6,
+        "send should fail with lock contention (exit 6) while --lock holds; stderr:\n{err}"
+    );
+
+    unsafe { libc::kill(client.id() as i32, libc::SIGTERM) };
+    let _ = client.wait();
+    std::thread::sleep(Duration::from_millis(400));
+
+    let (code2, _out2, err2) = tether_exit(&d, &["-d", "dev", "send", "ok-now", "--newline", "lf"]);
+    assert_eq!(
+        code2, 0,
+        "send should succeed once the locking pty exits; stderr:\n{err2}"
+    );
     let _ = std::fs::remove_file(&link);
     drop(d);
 }

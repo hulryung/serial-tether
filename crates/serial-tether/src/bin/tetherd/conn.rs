@@ -245,18 +245,23 @@ where
     drop(out_tx);
     let _ = writer_task.await;
     for sid in conn.session_ids() {
+        // Free a writer lock this session held before it's gone — otherwise
+        // an exclusive `lock` from a client that crashed/disconnected mid-
+        // flash would strand the device locked forever.
+        handlers::release_lock_for_session(&state, &sid);
         state.sessions.remove(&sid);
     }
     Ok(())
 }
 
 /// Methods that may block for a long time waiting on device output (a pattern
-/// match or a reconnect). These run on their own task so they don't stall
+/// match or a reconnect) — or, for `lock` with `preempt:"queue"`, on another
+/// session's release. These run on their own task so they don't stall
 /// in-order processing of the rest of the connection. Everything else — most
 /// importantly `send` — is dispatched inline, in arrival order, so writes reach
 /// the device in exactly the order the client issued them.
 fn is_blocking_method(method: &str) -> bool {
-    matches!(method, "expect" | "run" | "reconnect")
+    matches!(method, "expect" | "run" | "reconnect" | "lock")
 }
 
 async fn dispatch(
@@ -273,6 +278,8 @@ async fn dispatch(
         "send" => handlers::send(state, conn, params).await,
         "expect" => handlers::expect(state, conn, params).await,
         "run" => handlers::run(state, conn, params).await,
+        "lock" => handlers::lock(state, conn, params).await,
+        "unlock" => handlers::unlock(state, conn, params).await,
         "status" => handlers::status(state, conn, params).await,
         "list_ports" => handlers::list_ports(state, conn, params).await,
         "list_devices" => handlers::list_devices(state, conn, params).await,

@@ -182,8 +182,71 @@ tether exec "cat /proc/uptime" --json  # {output, exit_code, duration_ms}
 if tether exec "grep -q ok /tmp/state"; then echo "ready"; fi
 ```
 
-For raw / non-shell consoles (bootloaders mid-boot, custom firmware prompts),
-use `send` + `expect` or the server-side atomic `run` instead.
+The wrapper is a single line (`echo "<BEG>"; <cmd>; echo "<END>=$?"`) with no
+temp variable, so it works on POSIX shells **and** hush-enabled U-Boot. `exec`
+defaults to a CR line terminator, which suits serial shells and U-Boot alike.
+
+**U-Boot:** register the device `shell=uboot` (see below) so `exec`/`run` force
+CR-only framing — **never send `crlf` to U-Boot**, whose CLI runs a command on
+CR and then repeats it on the trailing LF (double execution). If a device shell
+can't report a numeric status (a non-POSIX console), `exec` still prints the
+output but reports the status as unknown — `exit_code: null` in `--json` and
+exit code **8** — never a fabricated `0`. See
+[docs/EXEC_NONPOSIX_SHELLS.md](docs/EXEC_NONPOSIX_SHELLS.md).
+
+For a truly raw / non-shell console (bootloaders mid-boot, custom firmware
+prompts), register it `shell=none` — `exec` then refuses immediately with the
+right recipe — and use `send` + `expect` or the server-side atomic `run`.
+
+### Per-device console personality
+
+Attach a shell personality to a device in the `-D` spec (daemon or standalone):
+
+```sh
+tetherd -D board=/dev/ttyUSB0,shell=uboot,prompt='=> '
+# shell=posix|uboot|none (default posix); prompt=<regex>; newline=lf|cr|crlf|none
+```
+
+- `shell=uboot` forces CR-only framing for `exec`/`run` and defaults `newline=cr`.
+- `shell=none` makes `exec` refuse at once (raw console → use run/send/expect).
+- `prompt=` becomes the default `-u` for `run`/`sync`, so `tether -d board run
+  "printenv"` needs no `-u`. `newline=` sets the default line terminator.
+
+These show up in `tether list-devices --json` and `tether status` (`shell`,
+`prompt`, `newline` fields).
+
+### Virtual serial ports — share the device with minicom, pyserial, flashers
+
+Other serial tools can't open a port `tetherd` already holds. Instead, give
+each tool its own **virtual serial port** — a client-side PTY bridged to the
+device, with a full copy of the stream (its own ring-buffer cursor):
+
+```sh
+tether -d a35 pty -- minicom -D {}        # port lives exactly as long as minicom
+tether -d a35 pty -- python3 flash.py {}  # {} = the port path; also in $TETHER_PTY
+tether -d a35 pty --link /tmp/a35.pty     # or: print the path, run until Ctrl-C
+tether -d a35 pty --read-only             # observation-only port
+```
+
+Run as many as you like — one per tool. (Two tools must **not** share one
+virtual port: the kernel splits the byte stream between simultaneous readers.)
+Works over TCP too: `tether -s tcp://lab:5557 -d a35 pty -- minicom -D {}`
+turns a board on a lab host into a local port on your laptop.
+
+For flashing, take the device's writer lock so nothing else can interleave
+bytes, and drive the board reset on the *real* port (a PTY carries no DTR/RTS):
+
+```sh
+tether -d a35 reset --seq "dtr=0 rts=1 wait=100 dtr=1 rts=0 wait=50 dtr=0"
+tether -d a35 pty --lock -- flasher --port {} --no-reset ...
+# while --lock is held, other sessions' writes fail with lock_contention
+```
+
+Caveats: a baud rate the tool sets on the virtual port is a no-op (the real
+rate is the daemon's config — change it with `tether config --baud`), and
+DTR/RTS toggles can't traverse a PTY (OS limitation) — use `tether reset`.
+There's also a daemon-side always-on variant (`-D 'a35=...,pty'` →
+`/tmp/tether-a35.pty`) for a single permanent consumer on the daemon host.
 
 ### Remote daemon (TCP)
 
@@ -283,7 +346,7 @@ The plain `tetherd -D /dev/ttyX` and `tether <cmd>` (no flags) still use
 ```sh
 tether --json run "$cmd" -u "$prompt" --literal --timeout-ms 5000
 # → { matched, match, output (decoded text), truncated, duration_ms, ... }
-# → exit 0 (ok) / 124 (timeout) / 2 (protocol) / 3 (connect) / 4 (device) / 5 (overflow) / 6 (lock) / 7 (unauthorized)
+# → exit 0 (ok) / 124 (timeout) / 2 (protocol) / 3 (connect) / 4 (device) / 5 (overflow) / 6 (lock) / 7 (unauthorized) / 8 (exec: non-numeric status)
 ```
 
 Agent-friendly defaults are baked in: `--strip-ansi`, `--strip-echo`, `--max-output-bytes 8192`. The `--json` payload includes a decoded `output` field so an LLM never has to deal with base64.

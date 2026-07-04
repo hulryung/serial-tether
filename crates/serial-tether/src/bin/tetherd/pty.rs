@@ -23,13 +23,14 @@
 use std::ffi::CStr;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use tokio::io::{unix::AsyncFd, Interest};
 
 use crate::buffer::RingBuffer;
 use crate::serial::SerialWriter;
+use crate::state::WriterLock;
 
 /// Async wrapper around the PTY master fd (mirrors the daemon's `FdPort`).
 struct PtyMaster {
@@ -146,6 +147,7 @@ pub fn spawn_pty_bridge(
     link: String,
     buffer: RingBuffer,
     writer: SerialWriter,
+    lock: Arc<WriterLock>,
 ) -> Result<()> {
     let (master_fd, slave_name, slave_keep) = create_pty()?;
 
@@ -169,14 +171,41 @@ pub fn spawn_pty_bridge(
     {
         let master = master.clone();
         let writer = writer.clone();
+        let lock = lock.clone();
         let id = id.clone();
         tokio::spawn(async move {
             let mut buf = [0u8; 4096];
+            let mut dropped_bytes: u64 = 0;
+            let mut last_warn: Option<Instant> = None;
             loop {
                 match master.read(&mut buf).await {
                     // No reader currently attached to the slave; idle briefly.
                     Ok(0) => tokio::time::sleep(Duration::from_millis(50)).await,
                     Ok(n) => {
+                        // The bridge has no session of its own — it never
+                        // *takes* the writer lock, but it must back off while
+                        // another session holds it exclusively (a `lock` RPC,
+                        // typically guarding a flash over the real port).
+                        // Writing tool bytes underneath that would interleave
+                        // two writers on the same wire.
+                        let exclusively_locked =
+                            lock.holder.lock().as_ref().is_some_and(|h| h.exclusive);
+                        if exclusively_locked {
+                            dropped_bytes += n as u64;
+                            let now = Instant::now();
+                            let should_warn = match last_warn {
+                                Some(t) => now.duration_since(t) >= Duration::from_secs(5),
+                                None => true,
+                            };
+                            if should_warn {
+                                tracing::warn!(
+                                    device = %id, dropped_bytes,
+                                    "virtual port writes blocked while device is locked"
+                                );
+                                last_warn = Some(now);
+                            }
+                            continue;
+                        }
                         if let Err(e) = writer.write(buf[..n].to_vec()).await {
                             tracing::debug!(device = %id, error = %e, "pty→device write failed");
                         }
@@ -196,6 +225,8 @@ pub fn spawn_pty_bridge(
         let master = master.clone();
         tokio::spawn(async move {
             let (mut cursor, _tail) = buffer.snapshot_seqs();
+            let mut dropped_bytes: u64 = 0;
+            let mut last_warn: Option<Instant> = None;
             loop {
                 let (chunk, new_cursor, _lag) = buffer.read_from(cursor);
                 cursor = new_cursor;
@@ -203,8 +234,46 @@ pub fn spawn_pty_bridge(
                     buffer.wait().await;
                     continue;
                 }
-                if let Err(e) = master.write_all(&chunk).await {
-                    tracing::warn!(device = %id, error = %e, "device→pty write failed");
+                // Bound how long we'll wait for the host tool to drain the
+                // pty. macOS's pty kernel buffer is tiny (~1KB), and we keep
+                // the slave fd open for the daemon's lifetime (see
+                // `slave_keep` above) so the master never sees EOF — with no
+                // reader attached, an unbounded `write_all` would park this
+                // task forever, freezing the cursor until a tool eventually
+                // attaches and then replaying a stale burst followed by a
+                // gap. Timing out and dropping the chunk instead keeps the
+                // bridge live; a freshly attached tool may still see up to
+                // ~1KB of buffered history from the kernel's own pty buffer,
+                // which is bounded and acceptable.
+                match tokio::time::timeout(Duration::from_millis(200), master.write_all(&chunk))
+                    .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        tracing::warn!(device = %id, error = %e, "device→pty write failed");
+                    }
+                    Err(_) => {
+                        // Timed out mid-write. `write_all` may have already
+                        // written a *prefix* of `chunk` before we cancelled
+                        // it — we have no way to know how much landed, so we
+                        // must not retry (that would risk duplicating
+                        // whatever prefix got through). Drop the whole chunk;
+                        // the cursor already advanced above, so the next
+                        // iteration moves on rather than getting stuck here.
+                        dropped_bytes += chunk.len() as u64;
+                        let now = Instant::now();
+                        let should_warn = match last_warn {
+                            Some(t) => now.duration_since(t) >= Duration::from_secs(5),
+                            None => true,
+                        };
+                        if should_warn {
+                            tracing::warn!(
+                                device = %id, dropped_bytes,
+                                "no reader on virtual port; dropping device output"
+                            );
+                            last_warn = Some(now);
+                        }
+                    }
                 }
             }
         });

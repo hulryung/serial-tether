@@ -9,6 +9,8 @@
 //!   5   buffer overflow (`max_bytes` exceeded)
 //!   6   lock contention (`preempt=fail` clash)
 //!   7   unauthorized (TCP auth token missing or wrong)
+//!   8   exec ran but the device shell reported no numeric status
+//!       (non-POSIX console; see docs/EXEC_NONPOSIX_SHELLS.md)
 //!   124 timeout (coreutils convention)
 
 use std::io::IsTerminal;
@@ -25,9 +27,19 @@ use tokio_util::codec::Framed;
 
 use tether_protocol::message::{ResponsePayload, RpcId};
 use tether_protocol::{
-    AttachParams, ExpectParams, HelloParams, Message, NdjsonCodec, Notification, Request,
-    Response, RunParams, SendParams, UntilSpec,
+    AttachParams, ExpectParams, HelloParams, LockParams, Message, NdjsonCodec, Notification,
+    Request, Response, RunParams, SendParams, UntilSpec,
 };
+
+// `tether pty` is Unix-only (openpty/termios/signals) — see the big comment
+// block ahead of `pty_session` for the whole feature. Imports are cfg-gated
+// too so a hypothetical non-unix build doesn't warn about unused ones.
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+#[cfg(unix)]
+use std::time::Instant;
+#[cfg(unix)]
+use tokio::io::{unix::AsyncFd, Interest};
 
 /// Trailing footer for `tether --help`. Kept brief so the long-help output
 /// still fits a single screen on most terminals; the URLs let humans (and
@@ -45,6 +57,7 @@ COMMANDS BY CATEGORY:
     Scripted RPCs:  send, expect, run, exec
     Inspection:     status, list-devices, ports, config, agents
     Line control:   break, dtr, rts, lines
+    Virtual port:   pty
     Lifecycle:      reconnect, disconnect, connect
 
 LEARN MORE:
@@ -83,9 +96,23 @@ the port; you attach as a client. You don't start or manage the daemon.
     tether -d <id> exec "<cmd>" --json   # {output, exit_code, duration_ms}
     # exits with the device command's status, like ssh:
     if tether -d <id> exec "test -f /etc/os-release"; then echo yes; fi
+    # exec works on Linux shells (bash/busybox/dash) AND hush-enabled U-Boot.
+    # It defaults to --newline cr, so U-Boot works out of the box; if a device
+    # is registered shell=uboot the CR-only rule is enforced automatically.
 
-## Raw / non-shell console (bootloader, login prompt)
-    tether -d <id> run "<cmd>" -u "<prompt-regex>" --newline crlf --json
+## U-Boot / bootloader consoles
+    # Easiest: register the device with shell=uboot (daemon or -D config):
+    #   tetherd -D board=/dev/ttyUSB0,shell=uboot,prompt='=> '
+    # then plain exec/run just work:
+    tether -d board exec "mdio list"
+    tether -d board run "printenv"          # -u defaults to the device prompt=
+    # NEVER send crlf to U-Boot: CR runs the line, the trailing LF repeats it
+    # (double execution). Use cr. exec on a shell=uboot device forces cr for you.
+    # A U-Boot built WITHOUT the hush parser can't run exec at all — use run:
+    tether -d board run "<cmd>" -u "=> " --newline cr
+
+## Raw / non-shell console (no shell at all)
+    tether -d <id> run "<cmd>" -u "<prompt-regex>" --newline cr --json
     tether -d <id> send "<bytes>" --newline cr
     tether -d <id> expect "<pattern>" --timeout-ms 5000
 
@@ -95,18 +122,37 @@ the port; you attach as a client. You don't start or manage the daemon.
 
 ## Exit codes
     0 ok   2 protocol   3 connection   4 disconnected   5 buffer-overflow
-    6 lock-contention   7 unauthorized   124 timeout
-    (exec additionally passes through the device command's own exit status)
+    6 lock-contention   7 unauthorized   8 exec-ran-but-no-numeric-status
+    124 timeout
+    (exec additionally passes through the device command's own exit status;
+     exit 8 / exit_code:null means the command ran but the shell isn't POSIX —
+     see docs/EXEC_NONPOSIX_SHELLS.md)
 
 ## Remote daemon (over TCP)
     export TETHER_AUTH_TOKEN=<token>
     tether -s tcp://<host>:5557 -d <id> exec "<cmd>"
 
+## Hand the port to a non-tether tool (virtual serial port)
+    tether -d <id> pty -- <tool> {}          # private virtual port; {} = its path (also $TETHER_PTY);
+                                             # port lives exactly as long as <tool>; exit code passes through
+    tether -d <id> pty --link /tmp/my.pty    # or: print the path on stdout (flushed, after ready), run until killed
+    tether -d <id> pty --read-only           # observation-only port
+    tether -d <id> pty --lock -- <flasher> {}   # exclusive: other sessions' writes fail with lock_contention
+Rules: one tool per virtual port (simultaneous readers split the byte stream);
+baud set by the tool on the virtual port is a no-op (real rate = daemon config);
+DTR/RTS can't traverse a PTY — reset the board first with
+`tether -d <id> reset --seq "dtr=0 rts=1 wait=100 dtr=1 rts=0 wait=50 dtr=0"`.
+
 ## Pitfalls
 - No `-d` on a multi-device daemon → error. Always pass `-d <id>`.
 - Don't pass a raw /dev path in scripts (`tether /dev/...`): it spawns or
   redirects a daemon. Use `-d <id>` against the shared daemon instead.
-- `exec` assumes a POSIX shell on the device. For raw consoles use run/send/expect.
+- `exec` needs a shell (Linux shell or hush-enabled U-Boot). For a truly raw
+  console (`shell=none`) exec refuses immediately — use run/send/expect.
+- NEVER `--newline crlf` toward U-Boot — it double-executes every command.
+  Use `cr` (or register the device `shell=uboot`, which enforces it).
+- exit_code null (JSON) / exit 8: the command ran but the shell reported no
+  numeric status — usually a non-POSIX console. See docs/EXEC_NONPOSIX_SHELLS.md.
 - `output` (in --json) is decoded UTF-8 with ANSI/echo stripped — use it, not `before`.
 "#;
 
@@ -172,6 +218,10 @@ struct Cli {
     /// run the requested command (or shell), then shut the daemon down
     /// when the client exits. Same UX as `tio /dev/ttyUSB0`.
     /// Cannot be combined with `-s tcp://...` or an explicit `-s` socket.
+    ///
+    /// Accepts the same inline settings as `tetherd -D`, including console
+    /// personality: `-D /dev/ttyUSB0,shell=uboot,prompt='=> '` makes `exec`
+    /// use CR-only framing and `run`'s `-u` default to the prompt.
     #[arg(short = 'D', long, global = true, value_name = "DEVICE", help_heading = "Standalone mode")]
     device: Option<String>,
 
@@ -285,8 +335,12 @@ enum Cmd {
         /// Data/command to send before waiting for --until.
         data: String,
         /// Pattern that ends the wait (regex by default; see --literal).
+        ///
+        /// Optional when the target device has a `prompt=` configured (see
+        /// `-D`/daemon device config): that prompt regex is used as the
+        /// default. Without either, `run` errors asking for `-u`.
         #[arg(short = 'u', long)]
-        until: String,
+        until: Option<String>,
         /// Give up waiting for --until after this many ms.
         #[arg(long, default_value_t = 3000)]
         timeout_ms: u32,
@@ -306,9 +360,12 @@ enum Cmd {
         #[arg(long, default_value = "queue", value_parser = ["queue", "fail", "force"])]
         preempt: String,
         /// Append a line terminator to the data before sending.
-        /// Most embedded shells (U-Boot, busybox, Linux login) want `crlf` or `lf`.
-        #[arg(long, default_value = "none", value_parser = ["none", "lf", "cr", "crlf"])]
-        newline: String,
+        /// Most embedded shells (U-Boot, busybox, Linux login) want `crlf`,
+        /// `lf`, or (U-Boot) `cr`. Defaults to the device's configured
+        /// `newline=`, else `none`. Never use `crlf` toward U-Boot — its CLI
+        /// double-executes (CR runs the line, the trailing LF repeats it).
+        #[arg(long, value_parser = ["none", "lf", "cr", "crlf"])]
+        newline: Option<String>,
     },
     /// Run a shell command on the device and capture just its output.
     ///
@@ -338,10 +395,13 @@ enum Cmd {
         /// Behaviour when the writer lock is contended.
         #[arg(long, default_value = "queue", value_parser = ["queue", "fail", "force"])]
         preempt: String,
-        /// Line terminator used to submit the command. Serial consoles
-        /// usually want `cr`.
-        #[arg(long, default_value = "cr", value_parser = ["lf", "cr", "crlf"])]
-        newline: String,
+        /// Line terminator used to submit the command. Serial consoles usually
+        /// want `cr` (the default). A device with `shell=uboot` always forces
+        /// `cr` regardless of this flag — `crlf`/`lf` double-execute U-Boot's
+        /// CLI. Otherwise resolves to the flag, then the device's `newline=`,
+        /// then `cr`.
+        #[arg(long, value_parser = ["lf", "cr", "crlf"])]
+        newline: Option<String>,
     },
 
     // ──────── Inspection ────────
@@ -431,6 +491,49 @@ enum Cmd {
         seq: Option<String>,
     },
 
+    // ──────── Virtual port (client-side) ────────
+    /// Create an on-demand virtual serial port on THIS machine, bridged to
+    /// the device through the daemon.
+    ///
+    /// `openpty()`s a fresh master/slave pair here — this also works against
+    /// a remote daemon over `-s tcp://...` — and publishes the slave under a
+    /// symlink: default `/tmp/tether-<id>-<n>.pty`, or `--link PATH`. Point
+    /// any serial tool (minicom, screen, pyserial, a vendor flasher) at that
+    /// path; it behaves like a real device node while `tether` relays bytes
+    /// to/from the daemon underneath. Distinct from the daemon's own `pty=`
+    /// device option (see `tetherd --help`) — this one lives in the client
+    /// and needs no daemon reconfiguration. With the global `--json`,
+    /// readiness is a single NDJSON line instead of the bare link path.
+    ///
+    /// Baud rate set by the attached tool is a no-op: a PTY has no UART, so
+    /// the real transfer rate is whatever the daemon's device config says.
+    /// For flashing: pass `--lock` to hold the writer lock for the session,
+    /// and run `tether reset` first if the flasher needs DTR/RTS auto-reset
+    /// (a PTY can't carry modem control).
+    ///
+    /// One tool per virtual port — run a separate `tether pty` (its own
+    /// `--link`) for each concurrent tool.
+    Pty {
+        /// Publish the slave under this path instead of the default
+        /// `/tmp/tether-<id>-<n>.pty`.
+        #[arg(long, value_name = "PATH")]
+        link: Option<String>,
+        /// Attach read-only: bytes typed into the virtual port are counted
+        /// and dropped instead of reaching the device.
+        #[arg(long)]
+        read_only: bool,
+        /// Hold the device's writer lock for this session (see `tether run
+        /// --preempt`). Needs a `tetherd` new enough to know the `lock` RPC.
+        #[arg(long)]
+        lock: bool,
+        /// Spawn CMD once the port is ready; every `{}` in its arguments is
+        /// replaced by the link path (appended as a final argument if none
+        /// contains `{}`). Bridging continues while CMD runs; `tether pty`
+        /// exits with CMD's status when it exits.
+        #[arg(last = true)]
+        exec: Vec<String>,
+    },
+
     // ──────── Lifecycle ────────
     /// Drop and reopen the serial device (kick a wedged bus).
     ///
@@ -502,7 +605,7 @@ fn main() -> ExitCode {
         // `exec` mirrors the device command's status. No extra message — the
         // captured output already went to stdout.
         Err(CliError::RemoteExit(code)) => ExitCode::from(code),
-        Err(CliError::Timeout) => ExitCode::from(124),
+        Err(CliError::Timeout(_)) => ExitCode::from(124),
         Err(CliError::DeviceDisconnected) => ExitCode::from(4),
         Err(CliError::BufferOverflow) => ExitCode::from(5),
         Err(CliError::LockContention) => ExitCode::from(6),
@@ -510,6 +613,10 @@ fn main() -> ExitCode {
             eprintln!("tether: unauthorized: {msg}");
             ExitCode::from(7)
         }
+        // The command ran but the device shell didn't hand back a numeric
+        // status. `print_exec_result` already printed the output and the
+        // one-line hint; just carry the distinct exit code.
+        Err(CliError::UnknownExecStatus) => ExitCode::from(8),
         Err(CliError::Protocol(msg)) => {
             eprintln!("protocol error: {msg}");
             ExitCode::from(2)
@@ -530,10 +637,18 @@ fn main() -> ExitCode {
 
 #[derive(Debug)]
 enum CliError {
-    Timeout,
+    /// A `run`/`expect` RPC timed out. Carries the daemon's decoded pre-match
+    /// buffer when available (from the error `data.buffered` field), so `exec`
+    /// can diagnose *why* the end marker never parsed instead of blaming a
+    /// missing prompt.
+    Timeout(Option<String>),
     /// `exec` only: the device command ran but returned a non-zero status,
     /// which `tether exec` mirrors as its own exit code (ssh-style).
     RemoteExit(u8),
+    /// `exec` only: the command ran and its output was captured, but the
+    /// device shell didn't report a numeric status (non-POSIX console left
+    /// the `$?` token literal). Distinct from a device failure.
+    UnknownExecStatus,
     DeviceDisconnected,
     BufferOverflow,
     LockContention,
@@ -1262,7 +1377,7 @@ where
             print_json_or_pairs(&v, cli.json);
         }
         Cmd::Send { data, base64: is_b64, newline } => {
-            let session_id = attach(&mut framed, &mut next_id, "now", cli.device_id.as_deref()).await?;
+            let session_id = attach(&mut framed, &mut next_id, "now", cli.device_id.as_deref(), "rw", "tether").await?;
             let mut p = SendParams {
                 session_id: session_id.clone(),
                 data: None,
@@ -1291,7 +1406,7 @@ where
             strip_ansi,
             max_output_bytes,
         } => {
-            let session_id = attach(&mut framed, &mut next_id, "now", cli.device_id.as_deref()).await?;
+            let session_id = attach(&mut framed, &mut next_id, "now", cli.device_id.as_deref(), "rw", "tether").await?;
             let p = ExpectParams {
                 session_id,
                 pattern: pattern.clone(),
@@ -1313,11 +1428,11 @@ where
             .await
             {
                 Ok(v) => print_match_result(&v, cli.json),
-                Err(CliError::Timeout) => {
+                Err(e @ CliError::Timeout(_)) => {
                     eprintln!(
                         "tether: timeout after {timeout_ms}ms waiting for {pattern:?}"
                     );
-                    return Err(CliError::Timeout);
+                    return Err(e);
                 }
                 Err(e) => return Err(e),
             }
@@ -1333,7 +1448,28 @@ where
             preempt,
             newline,
         } => {
-            let session_id = attach(&mut framed, &mut next_id, "now", cli.device_id.as_deref()).await?;
+            // Fill in `-u` and `--newline` from the device's console
+            // personality when the caller omitted them.
+            let personality =
+                fetch_personality(&mut framed, &mut next_id, cli.device_id.as_deref()).await;
+            let until = match until.or_else(|| personality.prompt.clone()) {
+                Some(u) => u,
+                None => {
+                    let dflag = dflag_fragment(cli.device_id.as_deref());
+                    return Err(CliError::Connection(format!(
+                        "tether: run needs a --until/-u pattern (none given and the device has \
+                         no `prompt=` configured).\n  \
+                         e.g. tether{dflag} run \"{data}\" -u \"<prompt-regex>\"\n  \
+                         or set `prompt=` on the device (see -D / daemon config)."
+                    )));
+                }
+            };
+            // Line terminator: explicit flag, else the device default, else
+            // `none` (run's historical default).
+            let newline = newline
+                .or_else(|| personality.newline.clone())
+                .unwrap_or_else(|| "none".to_string());
+            let session_id = attach(&mut framed, &mut next_id, "now", cli.device_id.as_deref(), "rw", "tether").await?;
             let p = RunParams {
                 session_id,
                 data: None,
@@ -1359,11 +1495,11 @@ where
             .await
             {
                 Ok(v) => print_match_result(&v, cli.json),
-                Err(CliError::Timeout) => {
+                Err(e @ CliError::Timeout(_)) => {
                     eprintln!(
                         "tether: timeout after {timeout_ms}ms waiting for {until:?}"
                     );
-                    return Err(CliError::Timeout);
+                    return Err(e);
                 }
                 Err(e) => return Err(e),
             }
@@ -1376,7 +1512,42 @@ where
             preempt,
             newline,
         } => {
-            let session_id = attach(&mut framed, &mut next_id, "now", cli.device_id.as_deref()).await?;
+            let personality =
+                fetch_personality(&mut framed, &mut next_id, cli.device_id.as_deref()).await;
+            let dflag = dflag_fragment(cli.device_id.as_deref());
+            // shell=none is a raw/non-shell console: `exec` can't work there.
+            // Fail fast with the run/send/expect recipe instead of hanging
+            // until the timeout on an end marker that will never appear.
+            if personality.shell == "none" {
+                return Err(CliError::Connection(format!(
+                    "tether: device is configured `shell=none` (raw/non-shell console) — \
+                     `exec` needs a shell.\n  \
+                     Use: tether{dflag} run \"{data}\" -u \"<prompt-regex>\" --newline cr\n  \
+                     or:  tether{dflag} send \"...\" --newline cr  then  \
+                     tether{dflag} expect \"<pattern>\""
+                )));
+            }
+            // Line terminator. U-Boot must use CR only: its CLI runs a command
+            // per CR and repeats the previous command on a bare LF, so CRLF
+            // double-executes. Force `cr` there regardless of the flag (warn if
+            // the caller asked for something else). Otherwise honor the flag,
+            // then the device default, then `cr`.
+            let newline = if personality.shell == "uboot" {
+                if let Some(n) = &newline {
+                    if n != "cr" {
+                        eprintln!(
+                            "tether: shell=uboot forces --newline cr (ignoring --newline {n}; \
+                             crlf/lf double-execute U-Boot's CLI)"
+                        );
+                    }
+                }
+                "cr".to_string()
+            } else {
+                newline
+                    .or_else(|| personality.newline.clone())
+                    .unwrap_or_else(|| "cr".to_string())
+            };
+            let session_id = attach(&mut framed, &mut next_id, "now", cli.device_id.as_deref(), "rw", "tether").await?;
             let (wrapped, until, begin_marker) = wrap_exec_command(&data);
             let p = RunParams {
                 session_id,
@@ -1406,31 +1577,34 @@ where
             .await
             {
                 Ok(v) => {
-                    let code = print_exec_result(&v, &begin_marker, cli.json);
-                    // Mirror the device command's status, ssh-style.
-                    return if code == 0 {
-                        Ok(())
-                    } else {
-                        Err(CliError::RemoteExit(code))
+                    // Mirror the device command's status, ssh-style: Some(0) ok,
+                    // Some(n) → that code, None → unknown (non-POSIX status).
+                    return match print_exec_result(&v, &begin_marker, cli.json) {
+                        Some(0) => Ok(()),
+                        Some(code) => Err(CliError::RemoteExit(code)),
+                        None => Err(CliError::UnknownExecStatus),
                     };
                 }
-                Err(CliError::Timeout) => {
-                    eprintln!(
-                        "tether: exec timed out after {timeout_ms}ms — no end-marker seen. \
-                         Is the device at a shell prompt? (exec needs a POSIX-ish shell; \
-                         for raw consoles use `send` + `expect`.)"
+                Err(CliError::Timeout(buffered)) => {
+                    exec_timeout_hint(
+                        timeout_ms,
+                        buffered.as_deref(),
+                        &begin_marker,
+                        &personality,
+                        &dflag,
+                        &data,
                     );
-                    return Err(CliError::Timeout);
+                    return Err(CliError::Timeout(buffered));
                 }
                 Err(e) => return Err(e),
             }
         }
         Cmd::Tail { from } => {
-            let session_id = attach(&mut framed, &mut next_id, &from, cli.device_id.as_deref()).await?;
+            let session_id = attach(&mut framed, &mut next_id, &from, cli.device_id.as_deref(), "rw", "tether").await?;
             tail_loop(&mut framed, &session_id).await?;
         }
         Cmd::Shell { from } => {
-            let session_id = attach(&mut framed, &mut next_id, &from, cli.device_id.as_deref()).await?;
+            let session_id = attach(&mut framed, &mut next_id, &from, cli.device_id.as_deref(), "rw", "tether").await?;
             shell_loop(framed, session_id).await?;
             return Ok(());
         }
@@ -1562,6 +1736,29 @@ where
             run_reset_sequence(&mut framed, &mut next_id, cli.device_id.as_deref(), &spec).await?;
             eprintln!("tether: reset sequence complete");
         }
+        Cmd::Pty { link, read_only, lock, exec } => {
+            #[cfg(unix)]
+            return pty_session(
+                framed,
+                next_id,
+                PtyOptions {
+                    device_id: cli.device_id.clone(),
+                    link_arg: link,
+                    read_only,
+                    lock,
+                    exec,
+                    force_json: cli.json,
+                },
+            )
+            .await;
+            #[cfg(not(unix))]
+            {
+                let _ = (framed, next_id, link, read_only, lock, exec, cli.json);
+                return Err(CliError::Connection(
+                    "tether pty requires a Unix host".into(),
+                ));
+            }
+        }
         Cmd::Disconnect => {
             let mut p = serde_json::Map::new();
             if let Some(d) = &cli.device_id { p.insert("device_id".into(), json!(d)); }
@@ -1588,8 +1785,12 @@ where
             }
         }
         Cmd::Sync { idle_ms, timeout_ms } => {
-            let session_id = attach(&mut framed, &mut next_id, "now", cli.device_id.as_deref()).await?;
-            // Send a single CR.
+            // Nudge the console with its configured line terminator (CR by
+            // default, which suits U-Boot and most serial shells).
+            let personality =
+                fetch_personality(&mut framed, &mut next_id, cli.device_id.as_deref()).await;
+            let nudge = apply_newline(String::new(), personality.newline.as_deref().unwrap_or("cr"));
+            let session_id = attach(&mut framed, &mut next_id, "now", cli.device_id.as_deref(), "rw", "tether").await?;
             call(
                 &mut framed,
                 &mut next_id,
@@ -1597,7 +1798,7 @@ where
                 serde_json::to_value(SendParams {
                     session_id: session_id.clone(),
                     data: None,
-                    data_text: Some("\r".into()),
+                    data_text: Some(nudge),
                     eat_echo: false,
                 })
                 .unwrap(),
@@ -1618,20 +1819,100 @@ where
     Ok(())
 }
 
+/// Console personality of a device as reported by the daemon (`-D shell=`,
+/// `prompt=`, `newline=`). Drives how `exec` frames commands / picks a line
+/// terminator and what `run` uses as its default `-u`.
+#[derive(Debug, Clone)]
+struct Personality {
+    /// "posix" | "uboot" | "none".
+    shell: String,
+    /// Default `-u` prompt regex for `run`, if configured.
+    prompt: Option<String>,
+    /// Default line terminator ("lf" | "cr" | "crlf" | "none"), if configured.
+    newline: Option<String>,
+}
+
+impl Personality {
+    fn posix() -> Self {
+        Self { shell: "posix".into(), prompt: None, newline: None }
+    }
+}
+
+/// Best-effort lookup of a device's console personality via `list_devices`.
+/// Any failure (pre-personality daemon, transport hiccup, device not found)
+/// falls back to the POSIX default so behaviour is unchanged in those cases.
+async fn fetch_personality<S>(
+    framed: &mut Framed<S, NdjsonCodec>,
+    next_id: &mut i64,
+    device_id: Option<&str>,
+) -> Personality
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let v = match call(framed, next_id, "list_devices", json!({})).await {
+        Ok(v) => v,
+        Err(_) => return Personality::posix(),
+    };
+    let devices = v
+        .get("devices")
+        .and_then(|d| d.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let default_id = v.get("default_device").and_then(|s| s.as_str());
+    // Mirror the daemon's device resolution: explicit id, else the only
+    // device, else the daemon's default. If we can't pin one down, POSIX.
+    let entry = match device_id {
+        Some(want) => devices
+            .iter()
+            .find(|d| d.get("id").and_then(|s| s.as_str()) == Some(want)),
+        None if devices.len() == 1 => devices.first(),
+        None => devices
+            .iter()
+            .find(|d| d.get("id").and_then(|s| s.as_str()) == default_id),
+    };
+    match entry {
+        Some(d) => Personality {
+            shell: d
+                .get("shell")
+                .and_then(|s| s.as_str())
+                .unwrap_or("posix")
+                .to_string(),
+            prompt: d.get("prompt").and_then(|s| s.as_str()).map(String::from),
+            newline: d.get("newline").and_then(|s| s.as_str()).map(String::from),
+        },
+        None => Personality::posix(),
+    }
+}
+
+/// Format the `-d <id>` fragment for hint messages: ` -d <id>` when a device
+/// is targeted, empty otherwise. Keeps copy-pasteable hints correct in both
+/// single- and multi-device daemons.
+fn dflag_fragment(device_id: Option<&str>) -> String {
+    match device_id {
+        Some(id) => format!(" -d {id}"),
+        None => String::new(),
+    }
+}
+
+/// Attach a session against `device_id` (daemon default if `None`), with the
+/// given replay policy, session `mode` (`"rw"` | `"ro"`), and a client
+/// `label` shown in the daemon's `status`/`list-devices` session listings.
 async fn attach<S>(
     framed: &mut Framed<S, NdjsonCodec>,
     next_id: &mut i64,
     replay: &str,
     device_id: Option<&str>,
+    mode: &str,
+    label: &str,
 ) -> Result<String, CliError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let p = AttachParams {
         session_id: None,
-        mode: "rw".into(),
+        mode: mode.into(),
         replay: tether_protocol::message::ReplaySpec::Named(replay.into()),
-        label: Some("tether".into()),
+        label: Some(label.into()),
         flow_control: "drop_oldest".into(),
         device_id: device_id.map(|s| s.to_string()),
     };
@@ -1672,7 +1953,9 @@ where
             }
             return match payload {
                 ResponsePayload::Ok { result } => Ok(result),
-                ResponsePayload::Err { error } => Err(map_rpc_error(error.code, error.message)),
+                ResponsePayload::Err { error } => {
+                    Err(map_rpc_error(error.code, error.message, error.data))
+                }
             };
         }
         // Ignore notifications.
@@ -1809,10 +2092,18 @@ where
     Ok(())
 }
 
-fn map_rpc_error(code: i32, msg: String) -> CliError {
+fn map_rpc_error(code: i32, msg: String, data: Option<Value>) -> CliError {
     use tether_protocol::error::ErrorCode as E;
     if code == E::Timeout.as_i32() {
-        CliError::Timeout
+        // Preserve the daemon's pre-match buffer (base64 in `data.buffered`)
+        // so exec can classify the failure. Decode lossily; None if absent.
+        let buffered = data
+            .as_ref()
+            .and_then(|d| d.get("buffered"))
+            .and_then(|s| s.as_str())
+            .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok())
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
+        CliError::Timeout(buffered)
     } else if code == E::DeviceDisconnected.as_i32() {
         CliError::DeviceDisconnected
     } else if code == E::BufferOverflow.as_i32() {
@@ -2270,6 +2561,655 @@ where
     Ok(())
 }
 
+// ──────────────────────────────────────────────────────────────────────────
+// `tether pty` — on-demand, client-side virtual serial port.
+//
+// Mirrors tetherd's daemon-side `pty=` bridge (see `tetherd/pty.rs`) but
+// lives entirely in the client: `openpty()` runs here, so it works against a
+// remote daemon too (`-s tcp://...`). Bytes flow over the *existing*
+// protocol — `data` notifications in, pipelined `send` requests out — no
+// daemon changes needed for the data path. Unix-only (openpty / termios /
+// unix signals); every item below is `#[cfg(unix)]`.
+// ──────────────────────────────────────────────────────────────────────────
+
+/// Async wrapper around the pty master fd. Mirrors `tetherd`'s `PtyMaster`
+/// (see `tetherd/pty.rs`); duplicated here because `tether` and `tetherd`
+/// are separate binaries in this crate with no shared lib target.
+#[cfg(unix)]
+struct PtyMaster {
+    fd: AsyncFd<OwnedFd>,
+}
+
+#[cfg(unix)]
+impl PtyMaster {
+    async fn read(&self, buf: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            let mut guard = self.fd.readable().await?;
+            let raw = self.fd.get_ref().as_raw_fd();
+            // SAFETY: raw fd is valid; buf is a writable slice.
+            let n = unsafe { libc::read(raw, buf.as_mut_ptr() as *mut _, buf.len()) };
+            if n >= 0 {
+                return Ok(n as usize);
+            }
+            let e = std::io::Error::last_os_error();
+            if e.kind() == std::io::ErrorKind::WouldBlock {
+                guard.clear_ready();
+                continue;
+            }
+            return Err(e);
+        }
+    }
+
+    async fn write_all(&self, mut data: &[u8]) -> std::io::Result<()> {
+        while !data.is_empty() {
+            let mut guard = self.fd.writable().await?;
+            let raw = self.fd.get_ref().as_raw_fd();
+            // SAFETY: raw fd is valid; data is a readable slice.
+            let n = unsafe { libc::write(raw, data.as_ptr() as *const _, data.len()) };
+            if n >= 0 {
+                data = &data[n as usize..];
+                continue;
+            }
+            let e = std::io::Error::last_os_error();
+            if e.kind() == std::io::ErrorKind::WouldBlock {
+                guard.clear_ready();
+                continue;
+            }
+            return Err(e);
+        }
+        Ok(())
+    }
+}
+
+/// `openpty()` + raw termios + non-blocking master, matching `tetherd`'s
+/// `create_pty` (see `tetherd/pty.rs`). Returns the async master, the
+/// slave's `/dev/...` path, and the slave fd — the caller keeps the fd open
+/// for as long as the virtual port should survive tool open/close cycles.
+#[cfg(unix)]
+fn create_client_pty() -> Result<(PtyMaster, String, OwnedFd), CliError> {
+    let mut master: RawFd = -1;
+    let mut slave: RawFd = -1;
+    let mut tio: libc::termios = unsafe { std::mem::zeroed() };
+    unsafe { libc::cfmakeraw(&mut tio) };
+    // SAFETY: out-params are valid; termios is initialized; win size null.
+    let r = unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            &mut tio,
+            std::ptr::null_mut(),
+        )
+    };
+    if r != 0 {
+        return Err(CliError::Connection(format!(
+            "tether pty: openpty: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+
+    let mut name_buf = [0 as libc::c_char; 256];
+    // SAFETY: slave is a valid tty fd; buffer is sized.
+    let rc = unsafe { libc::ttyname_r(slave, name_buf.as_mut_ptr(), name_buf.len()) };
+    if rc != 0 {
+        // SAFETY: both fds were just opened by openpty above.
+        unsafe {
+            libc::close(master);
+            libc::close(slave);
+        }
+        return Err(CliError::Connection(format!(
+            "tether pty: ttyname_r: {}",
+            std::io::Error::from_raw_os_error(rc)
+        )));
+    }
+    // SAFETY: ttyname_r NUL-terminated the buffer on success.
+    let slave_name = unsafe { std::ffi::CStr::from_ptr(name_buf.as_ptr()) }
+        .to_string_lossy()
+        .into_owned();
+
+    // Non-blocking master so AsyncFd can drive it.
+    // SAFETY: master is a valid fd.
+    unsafe {
+        let flags = libc::fcntl(master, libc::F_GETFL);
+        libc::fcntl(master, libc::F_SETFL, flags | libc::O_NONBLOCK);
+    }
+
+    // SAFETY: master/slave were just produced by openpty and are owned here.
+    let master_owned = unsafe { OwnedFd::from_raw_fd(master) };
+    let slave_owned = unsafe { OwnedFd::from_raw_fd(slave) };
+    let afd = AsyncFd::with_interest(master_owned, Interest::READABLE | Interest::WRITABLE)
+        .map_err(|e| CliError::Connection(format!("tether pty: AsyncFd for pty master: {e}")))?;
+    Ok((PtyMaster { fd: afd }, slave_name, slave_owned))
+}
+
+/// Default symlink path for the `n`th virtual port of a device (or the
+/// literal `"port"` fallback when no `-d` is given). Slots start at 1.
+#[cfg(unix)]
+fn default_pty_link(id_or_port: &str, n: u32) -> String {
+    format!("/tmp/tether-{id_or_port}-{n}.pty")
+}
+
+/// `kill(pid, 0)` liveness probe: `true` unless the pid is confirmed gone
+/// (`ESRCH`). `EPERM` (exists, owned by someone else) and any other
+/// unexpected errno are treated as "alive" — never guess a link is free.
+#[cfg(unix)]
+fn process_alive(pid: i32) -> bool {
+    // SAFETY: signal 0 probes existence; it delivers nothing.
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+/// Pure decision behind the `.pid` sidecar staleness check: given the
+/// sidecar's raw contents (`None` if missing/unreadable) and a liveness
+/// probe, decide whether the recorded holder is confirmed gone. `None`
+/// means "can't tell" (missing/unreadable/non-numeric) — the caller must
+/// treat that the same as "still alive".
+#[cfg(unix)]
+fn pid_sidecar_is_stale(contents: Option<&str>, probe: impl Fn(i32) -> bool) -> Option<bool> {
+    let pid: i32 = contents?.trim().parse().ok()?;
+    Some(!probe(pid))
+}
+
+/// If `<link>.pid` names a process that's confirmed gone, remove the stale
+/// link + sidecar and report `true` (caller should retry the claim).
+/// Otherwise (alive, or we can't tell) leaves everything alone.
+#[cfg(unix)]
+fn reclaim_if_stale(link: &str) -> bool {
+    let sidecar = format!("{link}.pid");
+    let contents = std::fs::read_to_string(&sidecar).ok();
+    if pid_sidecar_is_stale(contents.as_deref(), process_alive) == Some(true) {
+        let _ = std::fs::remove_file(link);
+        let _ = std::fs::remove_file(&sidecar);
+        true
+    } else {
+        false
+    }
+}
+
+/// Atomically claim `link` -> `slave`. A live collision reports `Ok(false)`
+/// ("busy, try something else"); a stale one is reclaimed and retried
+/// transparently. Never removes a link without first proving its holder is
+/// dead — a stale link can point at a pty slave the OS has since recycled
+/// to an unrelated process.
+#[cfg(unix)]
+fn try_claim_link(link: &str, slave: &str) -> Result<bool, CliError> {
+    loop {
+        match std::os::unix::fs::symlink(slave, link) {
+            Ok(()) => return Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                if reclaim_if_stale(link) {
+                    continue; // same path, now clear — retry once
+                }
+                return Ok(false);
+            }
+            Err(e) => return Err(CliError::Connection(format!("tether pty: symlink {link}: {e}"))),
+        }
+    }
+}
+
+/// Claim a link for the virtual port: `--link PATH` verbatim, or the
+/// default `/tmp/tether-<id-or-port>-<n>.pty` sequence starting at `n=1`.
+/// On success, writes our pid into `<link>.pid` so a future invocation can
+/// tell a stale leftover from one that's still running.
+#[cfg(unix)]
+fn claim_link(explicit: Option<&str>, id_or_port: &str, slave: &str) -> Result<String, CliError> {
+    let link = match explicit {
+        Some(path) => {
+            if !try_claim_link(path, slave)? {
+                return Err(CliError::Connection(format!(
+                    "tether pty: --link {path} is busy (claimed by a live process)"
+                )));
+            }
+            path.to_string()
+        }
+        None => {
+            let mut claimed = None;
+            for n in 1..=9999u32 {
+                let candidate = default_pty_link(id_or_port, n);
+                if try_claim_link(&candidate, slave)? {
+                    claimed = Some(candidate);
+                    break;
+                }
+            }
+            claimed.ok_or_else(|| {
+                CliError::Connection(
+                    "tether pty: no free /tmp/tether-*.pty slot found (9999 in use?)".into(),
+                )
+            })?
+        }
+    };
+    if let Err(e) = std::fs::write(format!("{link}.pid"), std::process::id().to_string()) {
+        let _ = std::fs::remove_file(&link);
+        return Err(CliError::Connection(format!("tether pty: write {link}.pid: {e}")));
+    }
+    Ok(link)
+}
+
+/// Removes the claimed symlink + `.pid` sidecar on every exit path
+/// (including panics), so a crashed or interrupted `tether pty` never
+/// leaves a stale link for the next invocation to trip over.
+#[cfg(unix)]
+struct PtyLinkGuard {
+    link: String,
+}
+
+#[cfg(unix)]
+impl Drop for PtyLinkGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.link);
+        let _ = std::fs::remove_file(format!("{}.pid", self.link));
+    }
+}
+
+/// Session label: `pty:<user>@<host>:<link>`, falling back to `pty:<link>`
+/// if the hostname lookup fails. Best-effort — shows up in the daemon's
+/// session listings so `status`/`list-devices` output identifies which
+/// virtual port a session belongs to.
+#[cfg(unix)]
+fn pty_label(link: &str) -> String {
+    let user = std::env::var("USER").unwrap_or_else(|_| "?".to_string());
+    match hostname_best_effort() {
+        Some(host) => format!("pty:{user}@{host}:{link}"),
+        None => format!("pty:{link}"),
+    }
+}
+
+#[cfg(unix)]
+fn hostname_best_effort() -> Option<String> {
+    let mut buf = [0u8; 256];
+    // SAFETY: buf is a valid, sized C buffer for gethostname to fill.
+    let r = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
+    if r != 0 {
+        return None;
+    }
+    // SAFETY: gethostname NUL-terminates the buffer on success.
+    let cstr = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr() as *const libc::c_char) };
+    cstr.to_str().ok().map(String::from)
+}
+
+/// True when an RPC failed because the daemon doesn't know the method at all
+/// (`-32601`) — i.e. a `tetherd` older than this client feature.
+#[cfg(unix)]
+fn is_method_not_found(e: &CliError) -> bool {
+    use tether_protocol::error::ErrorCode as E;
+    matches!(e, CliError::Protocol(msg) if msg.starts_with(&format!("rpc {}: ", E::MethodNotFound.as_i32())))
+}
+
+/// Substitute `{}` in `args` with `path`; if no arg contains `{}`, append
+/// `path` as a final argument. Pure so it's unit-tested without spawning.
+#[cfg(unix)]
+fn substitute_link_placeholder(args: &[String], path: &str) -> Vec<String> {
+    let mut found = false;
+    let mut out: Vec<String> = args
+        .iter()
+        .map(|a| {
+            if a.contains("{}") {
+                found = true;
+                a.replace("{}", path)
+            } else {
+                a.clone()
+            }
+        })
+        .collect();
+    if !found {
+        out.push(path.to_string());
+    }
+    out
+}
+
+/// ≤1-per-window stderr rate limiter for the bridge's drop/error warnings.
+#[cfg(unix)]
+struct RateLimiter {
+    window: Duration,
+    last: Option<Instant>,
+}
+
+#[cfg(unix)]
+impl RateLimiter {
+    fn new(window: Duration) -> Self {
+        Self { window, last: None }
+    }
+
+    /// `true` at most once per `window`; only print / reset counters when
+    /// this returns `true`.
+    fn ready(&mut self) -> bool {
+        let now = Instant::now();
+        match self.last {
+            Some(t) if now.duration_since(t) < self.window => false,
+            _ => {
+                self.last = Some(now);
+                true
+            }
+        }
+    }
+}
+
+/// Check the pty slave's termios; if the attached tool switched it out of
+/// raw mode (`ICANON`/`ECHO`, or `ICRNL`/`ONLCR` munging), reassert
+/// `cfmakeraw` and report `true`. Left uncorrected, a cooked/echo slave
+/// reflects device bytes back out over the bridge (an echo storm) and
+/// mangles binary data.
+#[cfg(unix)]
+fn reassert_raw_if_needed(slave_fd: RawFd) -> bool {
+    let mut tio: libc::termios = unsafe { std::mem::zeroed() };
+    // SAFETY: slave_fd is a valid, open tty fd for the whole bridge's life.
+    if unsafe { libc::tcgetattr(slave_fd, &mut tio) } != 0 {
+        return false; // transient failure; we'll check again next tick
+    }
+    let cooked = tio.c_lflag & (libc::ICANON | libc::ECHO) != 0
+        || tio.c_iflag & libc::ICRNL != 0
+        || tio.c_oflag & libc::ONLCR != 0;
+    if !cooked {
+        return false;
+    }
+    unsafe { libc::cfmakeraw(&mut tio) };
+    // SAFETY: same fd; termios now holds the raw settings we just built.
+    unsafe { libc::tcsetattr(slave_fd, libc::TCSANOW, &tio) == 0 }
+}
+
+/// Spawn the `-- CMD ARG...` child once the port is ready. `{}` anywhere in
+/// `exec` (including the command itself) is replaced by the link path;
+/// `TETHER_PTY` is also set so scripts can pick it up without relying on
+/// argv. Stdio is inherited so interactive tools (minicom, screen) work
+/// normally.
+#[cfg(unix)]
+fn spawn_exec_child(exec: &[String], link: &str) -> Result<tokio::process::Child, CliError> {
+    let substituted = substitute_link_placeholder(exec, link);
+    let (prog, args) = substituted
+        .split_first()
+        .ok_or_else(|| CliError::Connection("tether pty: -- needs a command".into()))?;
+    tokio::process::Command::new(prog)
+        .args(args)
+        .env("TETHER_PTY", link)
+        .spawn()
+        .map_err(|e| CliError::Connection(format!("tether pty: exec {prog}: {e}")))
+}
+
+/// Waits on `child` if present; never resolves when it's `None`, so it's
+/// safe to poll unconditionally as one arm of `tokio::select!`.
+#[cfg(unix)]
+async fn wait_child(
+    child: Option<&mut tokio::process::Child>,
+) -> std::io::Result<std::process::ExitStatus> {
+    match child {
+        Some(c) => c.wait().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Parsed `tether pty` options, bundled into one struct so `pty_session`'s
+/// signature stays under clippy's argument-count lint.
+#[cfg(unix)]
+struct PtyOptions {
+    device_id: Option<String>,
+    link_arg: Option<String>,
+    read_only: bool,
+    lock: bool,
+    exec: Vec<String>,
+    force_json: bool,
+}
+
+/// `tether pty` entry point: create the pty, claim its link, attach the
+/// session (optionally taking the writer lock), announce readiness, spawn
+/// `-- CMD` if given, then bridge bytes until Ctrl-C / SIGTERM / child exit /
+/// transport loss. See the `Cmd::Pty` doc comment for the user-facing
+/// contract this implements.
+#[cfg(unix)]
+async fn pty_session<S>(
+    mut framed: Framed<S, NdjsonCodec>,
+    mut next_id: i64,
+    opts: PtyOptions,
+) -> Result<(), CliError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    use std::io::Write as _;
+    let PtyOptions { device_id, link_arg, read_only, lock, exec, force_json } = opts;
+
+    // 1. Create the pty before touching the daemon at all — a failure here
+    //    (no pty slots, sandboxed host, …) shouldn't leave a session
+    //    attached with nothing to bridge to.
+    let (master, slave_name, slave_keep) = create_client_pty()?;
+    let slave_raw_fd = slave_keep.as_raw_fd();
+
+    // 2. Claim the symlink.
+    let id_or_port = device_id.as_deref().unwrap_or("port");
+    let link = claim_link(link_arg.as_deref(), id_or_port, &slave_name)?;
+    let _link_guard = PtyLinkGuard { link: link.clone() };
+
+    // 3. Attach the session.
+    let mode = if read_only { "ro" } else { "rw" };
+    let label = pty_label(&link);
+    let session_id =
+        attach(&mut framed, &mut next_id, "now", device_id.as_deref(), mode, &label).await?;
+
+    // 4. --lock.
+    if lock {
+        let p = LockParams {
+            session_id: session_id.clone(),
+            device_id: device_id.clone(),
+            preempt: "queue".into(),
+        };
+        match call(&mut framed, &mut next_id, "lock", serde_json::to_value(p).unwrap()).await {
+            Ok(v) => {
+                if !v.get("locked").and_then(|b| b.as_bool()).unwrap_or(false) {
+                    return Err(CliError::Connection(format!(
+                        "tether pty: --lock: daemon did not confirm the lock ({v})"
+                    )));
+                }
+                eprintln!("tether: writer lock held for this session");
+            }
+            Err(e) if is_method_not_found(&e) => {
+                eprintln!("tether: this daemon doesn't support --lock (upgrade tetherd)");
+                return Err(CliError::RemoteExit(2));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    // 5. Readiness — exactly one stdout write, then flush.
+    {
+        let mut stdout = std::io::stdout().lock();
+        if force_json {
+            let line = json!({
+                "event": "ready",
+                "path": link,
+                "device": device_id,
+                "session_id": session_id,
+            });
+            let _ = writeln!(stdout, "{line}");
+        } else if exec.is_empty() {
+            let _ = writeln!(stdout, "{link}");
+        }
+        let _ = stdout.flush();
+    }
+    eprintln!("tether: virtual port ready: {link} (Ctrl-C to stop)");
+
+    // 6. Optional `-- CMD`, spawned only after readiness is printed either
+    //    way (CMD itself gets the path via `{}` / `TETHER_PTY`).
+    let mut child = if exec.is_empty() {
+        None
+    } else {
+        Some(spawn_exec_child(&exec, &link)?)
+    };
+
+    // 7. Bridge until Ctrl-C / SIGTERM / child exit / transport loss.
+    run_pty_bridge(framed, session_id, master, slave_raw_fd, link, read_only, &mut child).await
+}
+
+/// The byte bridge itself, once setup (pty, link, attach, lock) is done.
+#[cfg(unix)]
+async fn run_pty_bridge<S>(
+    framed: Framed<S, NdjsonCodec>,
+    session_id: String,
+    master: PtyMaster,
+    slave_raw_fd: RawFd,
+    link: String,
+    read_only: bool,
+    child: &mut Option<tokio::process::Child>,
+) -> Result<(), CliError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let (mut sink, mut source) = framed.split();
+    let mut next_id: i64 = 1;
+
+    let mut write_drop_limiter = RateLimiter::new(Duration::from_secs(5));
+    let mut read_only_limiter = RateLimiter::new(Duration::from_secs(5));
+    let mut send_err_limiter = RateLimiter::new(Duration::from_secs(5));
+    let mut dropped_write_bytes: u64 = 0;
+    let mut dropped_typed_bytes: u64 = 0;
+
+    let mut termios_tick = tokio::time::interval(Duration::from_millis(500));
+    termios_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .map_err(|e| CliError::Connection(format!("tether pty: sigterm handler: {e}")))?;
+
+    let mut master_buf = [0u8; 4096];
+
+    let outcome = loop {
+        tokio::select! {
+            biased;
+
+            _ = tokio::signal::ctrl_c() => {
+                eprintln!("tether: stopping ({link})");
+                break Ok(());
+            }
+            _ = sigterm.recv() => {
+                eprintln!("tether: stopping ({link})");
+                break Ok(());
+            }
+            status = wait_child(child.as_mut()) => {
+                let code = match status {
+                    Ok(s) => s.code().map(|c| c as u8).unwrap_or(1), // signal death → 1
+                    Err(e) => {
+                        eprintln!("tether: waiting on child failed: {e}");
+                        1
+                    }
+                };
+                eprintln!("tether: child exited ({code}); stopping bridge");
+                break Err(CliError::RemoteExit(code));
+            }
+
+            // tool → device: read the pty master, fire a pipelined `send`
+            // (no waiting on its response — see the `source.next()` arm).
+            r = master.read(&mut master_buf) => {
+                match r {
+                    Ok(0) => tokio::time::sleep(Duration::from_millis(50)).await,
+                    Ok(n) => {
+                        if read_only {
+                            dropped_typed_bytes += n as u64;
+                            if read_only_limiter.ready() {
+                                eprintln!(
+                                    "tether: read-only: dropped {dropped_typed_bytes} bytes typed into {link}"
+                                );
+                                dropped_typed_bytes = 0;
+                            }
+                        } else {
+                            let id = next_id;
+                            next_id += 1;
+                            let p = SendParams {
+                                session_id: session_id.clone(),
+                                data: Some(base64::engine::general_purpose::STANDARD.encode(&master_buf[..n])),
+                                data_text: None,
+                                eat_echo: false,
+                            };
+                            let req = Request::new(RpcId::Number(id), "send", serde_json::to_value(p).unwrap());
+                            if sink.send(Message::Request(req)).await.is_err() {
+                                break Err(CliError::Connection("tether pty: daemon connection closed".into()));
+                            }
+                        }
+                    }
+                    Err(e) => break Err(CliError::Connection(format!("tether pty: pty master read: {e}"))),
+                }
+            }
+
+            // device → tool (data notifications), plus responses to our
+            // fire-and-forget `send`s (drained; only errors are surfaced).
+            item = source.next() => {
+                match item {
+                    None => {
+                        eprintln!("tether: daemon closed the connection — stopping ({link})");
+                        // TODO: session resume within the daemon's 30s window.
+                        break Err(CliError::Connection("daemon closed connection".into()));
+                    }
+                    Some(Err(e)) => break Err(CliError::Connection(format!("tether pty: codec error: {e}"))),
+                    Some(Ok(Message::Response(Response { payload: ResponsePayload::Err { error }, .. }))) => {
+                        if send_err_limiter.ready() {
+                            eprintln!("tether: send error: {} ({})", error.message, error.code);
+                        }
+                    }
+                    Some(Ok(Message::Response(_))) => {} // ok responses to fire-and-forget sends
+                    Some(Ok(Message::Request(_))) => {}   // daemon never sends requests
+                    Some(Ok(Message::Notification(Notification { method, params, .. }))) => {
+                        if method == "data" {
+                            let Some(p) = params else { continue };
+                            let same_session = p
+                                .get("session_id")
+                                .and_then(|s| s.as_str())
+                                .map(|s| s == session_id)
+                                .unwrap_or(true);
+                            if !same_session {
+                                continue;
+                            }
+                            let Some(b64) = p.get("data").and_then(|s| s.as_str()) else { continue };
+                            let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64) else { continue };
+                            // Never park forever: the pty's kernel buffer is
+                            // tiny (~1KB on macOS), so a stopped tool fills
+                            // it almost immediately.
+                            match tokio::time::timeout(Duration::from_millis(200), master.write_all(&bytes)).await {
+                                Ok(Ok(())) => {}
+                                Ok(Err(e)) => break Err(CliError::Connection(format!("tether pty: pty master write: {e}"))),
+                                Err(_) => {
+                                    // A prefix may already be in the kernel
+                                    // buffer; don't retry any of it (or the
+                                    // rest) — that would duplicate bytes on
+                                    // the tool's side.
+                                    dropped_write_bytes += bytes.len() as u64;
+                                    if write_drop_limiter.ready() {
+                                        eprintln!(
+                                            "tether: tool not reading {link}; dropped {dropped_write_bytes} bytes"
+                                        );
+                                        dropped_write_bytes = 0;
+                                    }
+                                }
+                            }
+                        } else if method == "device" {
+                            if let Some(p) = params {
+                                let kind = p.get("kind").and_then(|s| s.as_str()).unwrap_or("?");
+                                eprintln!("tether: [device {kind}]");
+                            }
+                        }
+                    }
+                }
+            }
+
+            _ = termios_tick.tick() => {
+                if reassert_raw_if_needed(slave_raw_fd) {
+                    eprintln!(
+                        "tether: reasserted raw mode on {link} (a tool set cooked/echo mode; binary data would corrupt)"
+                    );
+                }
+            }
+        }
+    };
+
+    // Best-effort: don't leave an exec'd tool running against a port that's
+    // about to disappear (link removal is handled by `PtyLinkGuard` back in
+    // `pty_session`).
+    if let Some(c) = child.as_mut() {
+        if matches!(c.try_wait(), Ok(None)) {
+            let _ = c.start_kill();
+            let _ = c.wait().await;
+        }
+    }
+    let _ = sink.close().await;
+    outcome
+}
+
 async fn sync_until_idle<S>(
     framed: &mut Framed<S, NdjsonCodec>,
     next_id: &mut i64,
@@ -2319,7 +3259,7 @@ where
                 }
                 last_growth = std::time::Instant::now();
             }
-            Err(CliError::Timeout) => {
+            Err(CliError::Timeout(_)) => {
                 if last_growth.elapsed() >= idle && !accumulated.is_empty() {
                     break;
                 }
@@ -2419,21 +3359,32 @@ fn wrap_exec_command(cmd: &str) -> (String, String, String) {
     let begin_print = format!("TETHEREXECBEG{tag}");
     let begin_typed = format!("TETHEREXECBE\"\"G{tag}");
     let end_typed = format!("TETHEREXECEN\"\"D{tag}");
-    // `__trc=$?` captures the *command's* status before the end-marker echo.
-    let wrapped = format!(
-        "echo \"{begin_typed}\"; {cmd}; __trc=$?; echo \"{end_typed}=$__trc\""
-    );
-    let end_re = format!("TETHEREXECEND{tag}=(-?[0-9]+)");
+    // `$?` is expanded *inside* the echo argument, so it still reflects
+    // `<cmd>`'s status without a temp variable. Dropping the old `__trc=$?`
+    // assignment is what makes this work on U-Boot hush (which has no bare
+    // variable assignment: `__trc=0` became `Unknown command '__trc=0'` and
+    // clobbered `$?`), while remaining correct on POSIX shells.
+    let wrapped = format!("echo \"{begin_typed}\"; {cmd}; echo \"{end_typed}=$?\"");
+    // Detection stays tolerant: match the marker with *any* non-space status
+    // token (a shell that doesn't expand `$?` leaves it literal, e.g. U-Boot's
+    // `$__trc`/`$?` or PowerShell's `True`/`False`). The status is parsed as an
+    // integer separately in `print_exec_result`; a non-numeric token yields an
+    // unknown exit code rather than a hang. `\S+` (not `\S*`) avoids matching
+    // the bare `=` before the status byte has arrived.
+    let end_re = format!(r"TETHEREXECEND{tag}=(\S+)");
     (wrapped, end_re, begin_print)
 }
 
-/// Print an `exec` result and return the device-side exit code. In JSON mode
-/// emits `{output, exit_code, duration_ms, truncated}`. Otherwise the captured
-/// output goes to stdout verbatim and a one-line summary goes to stderr when
-/// it's a TTY or the command failed. `begin_marker` brackets the start of the
-/// real output (everything before and including its line is the echoed command
-/// and is discarded).
-fn print_exec_result(v: &Value, begin_marker: &str, force_json: bool) -> u8 {
+/// Print an `exec` result and return the device-side exit code, or `None` when
+/// the shell did not report a numeric status (e.g. a non-POSIX console left the
+/// `$?` token literal). In JSON mode emits `{output, exit_code, duration_ms,
+/// truncated}` with `exit_code: null` for the unknown case — never a fabricated
+/// `0`. Otherwise the captured output goes to stdout verbatim and a one-line
+/// summary goes to stderr when it's a TTY or the command failed; an unknown
+/// status also prints a one-line hint pointing at the non-POSIX guide.
+/// `begin_marker` brackets the start of the real output (everything before and
+/// including its line is the echoed command and is discarded).
+fn print_exec_result(v: &Value, begin_marker: &str, force_json: bool) -> Option<u8> {
     let before_b64 = v.get("before").and_then(|s| s.as_str()).unwrap_or("");
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(before_b64)
@@ -2449,19 +3400,21 @@ fn print_exec_result(v: &Value, begin_marker: &str, force_json: bool) -> u8 {
         }
         None => raw.to_string(),
     };
-    // match_text looks like `TETHEREXECEND<tag>=<code>`; pull the trailing int.
+    // match_text looks like `TETHEREXECEND<tag>=<status>`; pull the trailing
+    // token and parse it as an integer. A non-numeric token (a shell that
+    // didn't expand `$?`) is an *unknown* status — never silently 0.
     let match_text = v.get("match").and_then(|s| s.as_str()).unwrap_or("");
-    let exit_code: u8 = match_text
+    let exit_code: Option<u8> = match_text
         .rsplit_once('=')
         .and_then(|(_, n)| n.trim().parse::<i64>().ok())
-        .map(|n| n.clamp(0, 255) as u8)
-        .unwrap_or(0);
+        .map(|n| n.clamp(0, 255) as u8);
     let truncated = v.get("truncated").and_then(|b| b.as_bool()).unwrap_or(false);
     let duration_ms = v.get("duration_ms").and_then(|n| n.as_u64());
 
     if force_json {
         let mut obj = serde_json::Map::new();
         obj.insert("output".into(), json!(output));
+        // null (not 0) when the device didn't report a numeric status.
         obj.insert("exit_code".into(), json!(exit_code));
         if let Some(d) = duration_ms {
             obj.insert("duration_ms".into(), json!(d));
@@ -2478,21 +3431,86 @@ fn print_exec_result(v: &Value, begin_marker: &str, force_json: bool) -> u8 {
     if !output.is_empty() && !output.ends_with('\n') {
         println!();
     }
-    if exit_code != 0 || truncated || std::io::stderr().is_terminal() {
-        let mut summary = format!("[exit {exit_code}");
-        if let Some(d) = duration_ms {
-            summary.push_str(&format!(", {d}ms"));
+    match exit_code {
+        None => {
+            eprintln!(
+                "tether: device shell did not report a numeric status \
+                 (non-POSIX console?) — see docs/EXEC_NONPOSIX_SHELLS.md"
+            );
         }
-        if truncated {
-            match v.get("original_bytes").and_then(|n| n.as_u64()) {
-                Some(orig) => summary.push_str(&format!(", truncated from {orig}B")),
-                None => summary.push_str(", truncated"),
+        Some(code) if code != 0 || truncated || std::io::stderr().is_terminal() => {
+            let mut summary = format!("[exit {code}");
+            if let Some(d) = duration_ms {
+                summary.push_str(&format!(", {d}ms"));
             }
+            if truncated {
+                match v.get("original_bytes").and_then(|n| n.as_u64()) {
+                    Some(orig) => summary.push_str(&format!(", truncated from {orig}B")),
+                    None => summary.push_str(", truncated"),
+                }
+            }
+            summary.push(']');
+            eprintln!("{summary}");
         }
-        summary.push(']');
-        eprintln!("{summary}");
+        Some(_) => {}
     }
     exit_code
+}
+
+/// Print the most useful one-line diagnosis for an `exec` timeout, chosen from
+/// what (if anything) reached the pre-match buffer. Ordered most-specific
+/// first, so an agent gets an actionable next step instead of the misleading
+/// "no end-marker seen" when the marker actually printed. `begin_marker` is
+/// `TETHEREXECBEG<tag>`, from which the end-marker prefix is derived.
+fn exec_timeout_hint(
+    timeout_ms: u32,
+    buffered: Option<&str>,
+    begin_marker: &str,
+    personality: &Personality,
+    dflag: &str,
+    cmd: &str,
+) {
+    let tag = begin_marker.strip_prefix("TETHEREXECBEG").unwrap_or("");
+    let end_prefix = format!("TETHEREXECEND{tag}=");
+    let buf = buffered.unwrap_or("");
+
+    // The end marker printed but its status token never parsed (e.g. the shell
+    // left `$?` literal, or the value was empty). The command ran; the shell
+    // just isn't POSIX. Say so instead of blaming a missing prompt.
+    if !tag.is_empty() && buf.contains(&end_prefix) {
+        eprintln!(
+            "tether: exec: the end marker was seen but the device shell did not report \
+             a numeric status (non-POSIX console?) — see docs/EXEC_NONPOSIX_SHELLS.md"
+        );
+        return;
+    }
+    // Classic non-hush U-Boot / raw-console symptom.
+    if buf.contains("Unknown command") {
+        eprintln!(
+            "tether: exec timed out after {timeout_ms}ms — the device looks like a U-Boot / \
+             raw console (saw \"Unknown command\").\n  \
+             Try: tether{dflag} run \"{cmd}\" -u \"=> \" --newline cr\n  \
+             or set `shell=uboot` on the device (see -D / daemon config). \
+             See docs/EXEC_NONPOSIX_SHELLS.md"
+        );
+        return;
+    }
+    // Configured U-Boot but still no marker: most likely a U-Boot built without
+    // the hush parser, which can't run `exec` at all.
+    if personality.shell == "uboot" {
+        eprintln!(
+            "tether: exec timed out after {timeout_ms}ms on a shell=uboot device — no end \
+             marker seen. A U-Boot built without the hush parser can't run `exec`; fall back to \
+             tether{dflag} run \"{cmd}\" -u \"=> \" --newline cr. See docs/EXEC_NONPOSIX_SHELLS.md"
+        );
+        return;
+    }
+    // Generic fallback.
+    eprintln!(
+        "tether: exec timed out after {timeout_ms}ms — no end-marker seen. \
+         Is the device at a shell prompt? (exec needs a POSIX-ish shell; for raw consoles use \
+         `run`/`send`/`expect`, or set `shell=` on the device — see docs/EXEC_NONPOSIX_SHELLS.md.)"
+    );
 }
 
 /// Pull responses off `resp_rx` until we see one whose id matches the request
@@ -2592,9 +3610,17 @@ fn print_device_list(v: &Value, force_json: bool) {
         } else {
             "disconnected"
         };
+        // Only surface a shell tag when it's not the plain-POSIX default, to
+        // keep the common case uncluttered.
+        let shell = d.get("shell").and_then(|s| s.as_str()).unwrap_or("posix");
+        let shell_tag = if shell != "posix" {
+            format!("  shell={shell}")
+        } else {
+            String::new()
+        };
         println!(
-            "{:10}  {} @ {} {}{}{} flow={}  [{}]{}",
-            id, path, baud, data_bits, parity_letter, stop_bits, flow, status, marker
+            "{:10}  {} @ {} {}{}{} flow={}  [{}]{}{}",
+            id, path, baud, data_bits, parity_letter, stop_bits, flow, status, shell_tag, marker
         );
     }
 }
@@ -2634,6 +3660,16 @@ fn print_device_config(device: &Value, force_json: bool) {
     println!("framing:      {data_bits}{parity_letter}{stop_bits}");
     println!("flow_control: {flow}");
     println!("connected:    {connected}");
+    // Console personality (present on daemons that support `-D shell=`).
+    if let Some(shell) = device.get("shell").and_then(|s| s.as_str()) {
+        println!("shell:        {shell}");
+    }
+    if let Some(prompt) = device.get("prompt").and_then(|s| s.as_str()) {
+        println!("prompt:       {prompt}");
+    }
+    if let Some(newline) = device.get("newline").and_then(|s| s.as_str()) {
+        println!("newline:      {newline}");
+    }
 }
 
 /// Append a line terminator if requested.
@@ -2682,6 +3718,53 @@ mod tests {
         // Label carries the description when present, bare path otherwise.
         assert_eq!(got[0].label, "/dev/cu.usbserial-0001  (CP2102 USB to UART)");
         assert_eq!(got[1].label, "/dev/cu.usbserial-3");
+    }
+
+    #[test]
+    fn wrap_exec_command_is_unified_and_hush_safe() {
+        let (wrapped, end_re, begin) = wrap_exec_command("mdio list");
+        // The old `__trc=$?` temp assignment is gone — that's what broke hush.
+        assert!(
+            !wrapped.contains("__trc"),
+            "wrapper must not use a temp var: {wrapped}"
+        );
+        // Status is captured by expanding `$?` inside the end echo's argument.
+        assert!(wrapped.contains("=$?\""), "wrapper must echo =$?: {wrapped}");
+        assert!(wrapped.contains("mdio list"));
+        // Split-quote markers in the *typed* form, contiguous in the regex.
+        assert!(wrapped.contains("TETHEREXECBE\"\"G"));
+        assert!(wrapped.contains("TETHEREXECEN\"\"D"));
+        assert!(begin.starts_with("TETHEREXECBEG"));
+        // Tolerant end regex: any non-space status token, not just digits.
+        assert!(end_re.contains("=(\\S+)"), "end regex should be tolerant: {end_re}");
+    }
+
+    #[test]
+    fn print_exec_result_reports_unknown_status_as_none() {
+        // A non-numeric status token (shell left `$?` literal) must be None,
+        // never a fabricated 0.
+        let tag = "abc123abc123";
+        let before = base64::engine::general_purpose::STANDARD
+            .encode(format!("TETHEREXECBEG{tag}\nhello\n"));
+        let v = json!({
+            "before": before,
+            "match": format!("TETHEREXECEND{tag}=$__trc"),
+        });
+        assert_eq!(
+            print_exec_result(&v, &format!("TETHEREXECBEG{tag}"), true),
+            None
+        );
+
+        // A numeric status parses back to that code.
+        let v_ok = json!({
+            "before": base64::engine::general_purpose::STANDARD
+                .encode(format!("TETHEREXECBEG{tag}\nhello\n")),
+            "match": format!("TETHEREXECEND{tag}=42"),
+        });
+        assert_eq!(
+            print_exec_result(&v_ok, &format!("TETHEREXECBEG{tag}"), true),
+            Some(42)
+        );
     }
 
     #[test]
@@ -2743,5 +3826,51 @@ mod tests {
         assert!(!command_needs_device(&Cmd::Agents));
         assert!(command_needs_device(&Cmd::Tail { from: "now".into() }));
         assert!(command_needs_device(&Cmd::Lines));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn substitute_link_placeholder_replaces_all_occurrences() {
+        let args = vec!["minicom".to_string(), "-D".to_string(), "{}".to_string()];
+        assert_eq!(
+            substitute_link_placeholder(&args, "/tmp/x.pty"),
+            vec!["minicom", "-D", "/tmp/x.pty"]
+        );
+        // `{}` embedded inside a larger token is also substituted.
+        let args = vec!["--device={}".to_string()];
+        assert_eq!(
+            substitute_link_placeholder(&args, "/tmp/x.pty"),
+            vec!["--device=/tmp/x.pty"]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn substitute_link_placeholder_appends_when_no_placeholder() {
+        let args = vec!["python3".to_string(), "script.py".to_string()];
+        assert_eq!(
+            substitute_link_placeholder(&args, "/tmp/x.pty"),
+            vec!["python3", "script.py", "/tmp/x.pty"]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn default_pty_link_uses_id_and_slot() {
+        assert_eq!(default_pty_link("board0", 1), "/tmp/tether-board0-1.pty");
+        assert_eq!(default_pty_link("port", 3), "/tmp/tether-port-3.pty");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pid_sidecar_staleness_decision() {
+        // Missing/unreadable sidecar: can't tell — caller treats as alive.
+        assert_eq!(pid_sidecar_is_stale(None, |_| true), None);
+        // Non-numeric contents: also can't tell.
+        assert_eq!(pid_sidecar_is_stale(Some("not-a-pid"), |_| true), None);
+        // Probe says alive → not stale.
+        assert_eq!(pid_sidecar_is_stale(Some("123"), |_| true), Some(false));
+        // Probe says gone → stale, safe to reclaim.
+        assert_eq!(pid_sidecar_is_stale(Some("123"), |_| false), Some(true));
     }
 }

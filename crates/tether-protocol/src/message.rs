@@ -110,6 +110,21 @@ pub struct DeviceInfo {
     /// daemons always populate this.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
+    /// Console personality: `"posix"` | `"uboot"` | `"none"` (see the `-D
+    /// shell=` device setting). Drives how `exec` frames commands and what
+    /// hints the client prints. Defaults to `"posix"` for daemons that
+    /// pre-date the setting.
+    #[serde(default = "default_shell")]
+    pub shell: String,
+    /// Default `-u` prompt regex for `run` / `sync` when the caller omits
+    /// `-u`. `None` means the caller must supply one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+    /// Default line terminator (`"lf"` | `"cr"` | `"crlf"` | `"none"`) applied
+    /// by `run` when `--newline` is not given. `None` means no per-device
+    /// default (the command's own default applies).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub newline: Option<String>,
 }
 
 /// Compact summary used in `list_devices` and the new `StatusResult.devices`
@@ -129,6 +144,17 @@ pub struct DeviceSummary {
     /// closed the port; auto-reconnect is paused until `connect_device`.
     #[serde(default)]
     pub explicitly_disconnected: bool,
+    /// Console personality: `"posix"` | `"uboot"` | `"none"`. See
+    /// [`DeviceInfo::shell`].
+    #[serde(default = "default_shell")]
+    pub shell: String,
+    /// Default `-u` prompt regex for `run` / `sync`. See
+    /// [`DeviceInfo::prompt`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+    /// Default line terminator for `run`. See [`DeviceInfo::newline`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub newline: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -141,6 +167,7 @@ pub struct ListDevicesResult {
 }
 
 fn default_data_bits() -> u8 { 8 }
+fn default_shell() -> String { "posix".into() }
 fn default_parity() -> String { "none".into() }
 fn default_stop_bits() -> u8 { 1 }
 fn default_serial_flow_control() -> String { "none".into() }
@@ -453,6 +480,41 @@ pub struct RunResult {
     pub match_text: String,
     pub duration_ms: u64,
     pub match_seq: u64,
+}
+
+// ---------- Explicit writer lock (since v0.11) ----------
+//
+// Unlike the transient hold `run` takes internally (released the instant its
+// send+expect transaction completes), `lock` grants *exclusive* possession of
+// the device's writer lock that persists until `unlock`, session detach, or
+// connection teardown. Exclusive holds additionally gate plain `send` from
+// other sessions — see PROTOCOL.md's writer-lock section.
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LockParams {
+    pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<String>,
+    /// "queue" | "fail" | "force". Same semantics as `RunParams::preempt`.
+    #[serde(default = "default_preempt")]
+    pub preempt: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LockResult {
+    pub locked: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UnlockParams {
+    pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UnlockResult {
+    pub unlocked: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -45,24 +45,51 @@ if tether -d board0 exec "test -f /etc/os-release"; then echo present; fi
 ```
 
 No prompt to detect, no `--until` to craft. This is the 90% case once a shell
-is up. Default line ending is `cr`; pass `--newline lf`/`crlf` if the device
-needs it.
+is up. Default line ending is `cr`, which suits both Linux shells and U-Boot;
+pass `--newline lf` if a Linux shell needs it.
+
+The wrapper is a single line — `echo "<BEG>"; <cmd>; echo "<END>=$?"` — with no
+temp variable, so it runs unchanged on POSIX shells **and** hush-enabled U-Boot
+(hush expands `$?`). If the device shell can't report a numeric status (a
+non-POSIX console), `exec` still prints the captured output but reports the
+status as **unknown**: `exit_code: null` in `--json`, exit code **8** at the
+process level, plus a one-line stderr hint. It never fabricates a `0`.
+
+### U-Boot consoles
+
+Register the device as U-Boot once and both `exec` and `run` just work:
+
+```sh
+tetherd -D board=/dev/ttyUSB0,shell=uboot,prompt='=> '
+tether -d board exec "mdio list"     # unified wrapper, CR-only framing
+tether -d board run "printenv"       # -u defaults to the device prompt=
+```
+
+`shell=uboot` forces a **CR-only** line terminator. **Never send `crlf` to
+U-Boot** — its CLI runs the command on CR and then repeats it on the trailing
+LF (double execution). `exec` on a `shell=uboot` device enforces CR for you and
+warns if you pass `--newline crlf`/`lf`. A U-Boot built *without* the hush
+parser can't run `exec` at all; fall back to
+`tether -d board run "<cmd>" -u "=> " --newline cr`.
 
 ### Raw / non-shell console → `run`
 
 Bootloader mid-boot, login prompt, vendor MCU monitor — anything without a
-shell to run `echo`/`$?`:
+shell to run `echo`/`$?` (register these `shell=none`, which makes `exec`
+refuse immediately with this recipe instead of timing out):
 
 ```sh
-tether -d <id> --json run "<COMMAND>" --newline crlf -u "<PROMPT_REGEX>" --timeout-ms <T>
+tether -d <id> --json run "<COMMAND>" --newline cr -u "<PROMPT_REGEX>" --timeout-ms <T>
 ```
 
 `run` is a single daemon-side transaction: it holds the writer lock, sends
 `<COMMAND>` plus the newline you choose, and waits for `<PROMPT_REGEX>` with a
-hard timeout — race-free, no interleaving from other clients. `--newline lf`
-for Unix endings, `--newline none` (default) if the command already contains
-its terminator. Add `--literal` to treat the pattern as a fixed string instead
-of a regex (prompts often contain `.`, `$`, `>`).
+hard timeout — race-free, no interleaving from other clients. Serial consoles
+usually want `--newline cr`; `--newline lf` for Unix endings, `--newline none`
+if the command already contains its terminator. When `--newline`/`-u` are
+omitted they default to the device's configured `newline=`/`prompt=`. Add
+`--literal` to treat the pattern as a fixed string instead of a regex (prompts
+often contain `.`, `$`, `>`).
 
 ## Stable JSON fields
 
@@ -70,6 +97,8 @@ of a regex (prompts often contain `.`, `$`, `>`).
 
 ```jsonc
 { "output": "...", "exit_code": 0, "duration_ms": 12, "truncated": false }
+// exit_code is null (never fabricated 0) when the device shell reported no
+// numeric status — a non-POSIX console. See docs/EXEC_NONPOSIX_SHELLS.md.
 ```
 
 `run --json` / `expect --json`:
@@ -103,6 +132,7 @@ non-UTF-8 boards).
  5   buffer overflow                (--max-bytes hit without a match)
  6   lock contention                (--preempt=fail and someone else holds the lock)
  7   unauthorized                   (TCP transport: --auth-token missing or wrong)
+ 8   exec ran, status unknown       (non-POSIX console; exit_code:null — see EXEC_NONPOSIX_SHELLS.md)
  124 timeout                        (no match within --timeout-ms)
 ```
 
@@ -173,8 +203,10 @@ Don't guess the prompt for `run`. Boards differ. `sync` is cheap.
 |---|---|---|
 | `-32015 ambiguous_device` | Multi-device daemon, no `-d` | Add `-d <id>` (`list-devices` to find it) |
 | Agent hangs on a menu | PTY + ambiguous target | Set `TETHER_NONINTERACTIVE=1` and pass `-d <id>` |
-| `run` times out, no match | Forgot `--newline` | Add `--newline crlf` (or `lf`) |
-| `exec` times out | Device isn't at a POSIX shell | Use `run`/`send`/`expect` for raw consoles |
+| `run` times out, no match | Forgot `--newline` | Add `--newline cr` (serial), or `lf`/`crlf` |
+| `exec` times out | Device isn't at a shell | Register `shell=uboot`/`shell=none`, or use `run`/`send`/`expect` |
+| `exec` exit 8 / `exit_code: null` | Non-POSIX console: no numeric `$?` | See docs/EXEC_NONPOSIX_SHELLS.md |
+| U-Boot runs every command twice | Sent `--newline crlf` | Use `cr` (or register `shell=uboot`) — never crlf to U-Boot |
 | Output begins with the command itself | `run --strip-echo` disabled | Re-enable (on by default); `exec` strips it always |
 | Match found in *previous* output | `expect` without anchoring | Use `run` (or `exec`) instead |
 | Garbled / random bytes | Wrong baud rate | `tether -d <id> status` shows the configured baud |

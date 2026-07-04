@@ -9,9 +9,10 @@ use tether_protocol::message::LockState;
 use tether_protocol::{
     AckResult, AttachParams, AttachResult, BufferInfo, ConnectDeviceResult, DetachParams,
     DeviceInfo, DeviceSummary, DeviceTarget, DisconnectDeviceResult, ExpectMatch, ExpectParams,
-    HelloParams, HelloResult, ListDevicesResult, ListPortsResult, PortInfo, ProtocolError,
-    ReadModemStatusResult, RunParams, SendBreakParams, SendParams, SendResult, SetDeviceParams,
-    SetDeviceResult, SetLineParams, StatusResult,
+    HelloParams, HelloResult, ListDevicesResult, ListPortsResult, LockParams, LockResult,
+    PortInfo, ProtocolError, ReadModemStatusResult, RunParams, SendBreakParams, SendParams,
+    SendResult, SetDeviceParams, SetDeviceResult, SetLineParams, StatusResult, UnlockParams,
+    UnlockResult,
 };
 use tether_protocol::error::ErrorCode;
 
@@ -26,7 +27,11 @@ use crate::state::DaemonState;
 /// Read a snapshot of the shared serial config and convert it into a wire
 /// `DeviceInfo`. Used by `hello`, `status`, and `set_device`. Phase 2 will
 /// thread the device id through here; for now it stays None.
-fn device_info_from(cfg: &SerialConfig, connected: bool) -> DeviceInfo {
+fn device_info_from(
+    cfg: &SerialConfig,
+    connected: bool,
+    console: &crate::state::ConsolePersonality,
+) -> DeviceInfo {
     DeviceInfo {
         path: cfg.path.clone(),
         baud: cfg.baud,
@@ -36,6 +41,9 @@ fn device_info_from(cfg: &SerialConfig, connected: bool) -> DeviceInfo {
         flow_control: cfg.flow_control.as_str().into(),
         connected,
         id: None,
+        shell: console.shell.clone(),
+        prompt: console.prompt.clone(),
+        newline: console.newline.clone(),
     }
 }
 
@@ -114,7 +122,7 @@ pub async fn hello(
         .expect("default device always present");
     let (head, tail) = dev.buffer.snapshot_seqs();
     let device_connected = dev.state.lock().connected;
-    let mut device = device_info_from(&dev.config.lock(), device_connected);
+    let mut device = device_info_from(&dev.config.lock(), device_connected, &dev.console);
     device.id = Some(dev.id.clone());
     let result = HelloResult {
         server_version: SERVER_VERSION.to_string(),
@@ -187,6 +195,10 @@ pub async fn detach(
     if !conn.has_session(&p.session_id) {
         return Err(err(ErrorCode::SessionNotAttached));
     }
+    // Release any writer lock this session held — otherwise an exclusive
+    // lock taken via `lock` would outlive the session with no way to `unlock`
+    // it.
+    release_lock_for_session(state, &p.session_id);
     state.sessions.remove(&p.session_id);
     conn.remove_session(&p.session_id);
     Ok(json!({}))
@@ -201,6 +213,7 @@ pub async fn send(
     let bytes = collect_send_bytes(p.data.as_deref(), p.data_text.as_deref())?;
     let session = check_session(state, conn, &p.session_id, true)?;
     let device = state.device_for_session(&p.session_id)?;
+    reject_if_exclusively_locked(&device.lock, &p.session_id)?;
     let n = bytes.len() as u64;
     let sent_at_seq = device
         .writer
@@ -256,9 +269,11 @@ pub async fn run(
     let device = state.device_for_session(&p.session_id)?;
 
     // Acquire the device's writer lock for the duration of this transaction.
-    acquire_lock(&device, &p.session_id, &p.preempt).await?;
+    // `run`'s hold is non-exclusive — see `LockGuard`'s doc comment for why
+    // its drop is safe even when an explicit `lock` overlaps this hold.
+    acquire_lock(&device.lock, &p.session_id, &p.preempt, false).await?;
     let _guard = LockGuard {
-        device: device.clone(),
+        lock: device.lock.clone(),
         session_id: p.session_id.clone(),
     };
 
@@ -300,6 +315,38 @@ pub async fn run(
     Ok(v)
 }
 
+/// Take exclusive, session-held possession of the device's writer lock. Unlike
+/// `run`'s internal transient hold, this persists until `unlock`, session
+/// detach, or connection teardown — and it also blocks plain `send` from
+/// other sessions (see `reject_if_exclusively_locked`). Meant for a session
+/// that's about to flash the device out-of-band and needs the wire to itself.
+pub async fn lock(
+    state: &DaemonState,
+    conn: &ConnState,
+    params: Option<Value>,
+) -> Result<Value, ProtocolError> {
+    let p: LockParams = parse_params(params)?;
+    check_session(state, conn, &p.session_id, true)?;
+    let device = resolve_locked_device(state, &p.session_id, p.device_id.as_deref())?;
+    acquire_lock(&device.lock, &p.session_id, &p.preempt, true).await?;
+    Ok(serde_json::to_value(LockResult { locked: true }).unwrap())
+}
+
+/// Release an exclusive lock this session holds. Idempotent — releasing an
+/// already-free lock succeeds; releasing a lock held by *another* session
+/// fails with `LockContention` rather than silently stealing it.
+pub async fn unlock(
+    state: &DaemonState,
+    conn: &ConnState,
+    params: Option<Value>,
+) -> Result<Value, ProtocolError> {
+    let p: UnlockParams = parse_params(params)?;
+    check_session(state, conn, &p.session_id, true)?;
+    let device = resolve_locked_device(state, &p.session_id, p.device_id.as_deref())?;
+    release_lock_if_holder(&device.lock, &p.session_id)?;
+    Ok(serde_json::to_value(UnlockResult { unlocked: true }).unwrap())
+}
+
 pub async fn status(
     state: &DaemonState,
     _conn: &ConnState,
@@ -312,9 +359,9 @@ pub async fn status(
         let (head, tail) = dev.buffer.snapshot_seqs();
         let connected = dev.state.lock().connected;
         let explicitly_disconnected = dev.state.lock().explicitly_disconnected;
-        let mut info = device_info_from(&dev.config.lock(), connected);
+        let mut info = device_info_from(&dev.config.lock(), connected, &dev.console);
         info.id = Some(dev.id.clone());
-        let holder = dev.lock.holder.lock().clone();
+        let holder = dev.lock.holder.lock().as_ref().map(|h| h.session_id.clone());
         // Filter the global session list down to ones bound to this device.
         let dev_id = dev.id.clone();
         let dev_sessions: Vec<SessionInfo> = state
@@ -344,9 +391,10 @@ pub async fn status(
         .expect("default device always present");
     let (head, tail) = default_dev.buffer.snapshot_seqs();
     let device_connected = default_dev.state.lock().connected;
-    let mut device = device_info_from(&default_dev.config.lock(), device_connected);
+    let mut device =
+        device_info_from(&default_dev.config.lock(), device_connected, &default_dev.console);
     device.id = Some(default_dev.id.clone());
-    let holder = default_dev.lock.holder.lock().clone();
+    let holder = default_dev.lock.holder.lock().as_ref().map(|h| h.session_id.clone());
     let result = StatusResult {
         device,
         buffer: BufferInfo {
@@ -566,7 +614,7 @@ pub async fn set_device(
         })?;
 
     let device_connected = target.state.lock().connected;
-    let mut device = device_info_from(&target.config.lock(), device_connected);
+    let mut device = device_info_from(&target.config.lock(), device_connected, &target.console);
     device.id = Some(target.id.clone());
 
     // Notify all attached clients about the live config change so UIs can
@@ -617,6 +665,9 @@ pub async fn list_devices(
                 flow_control: cfg.flow_control.as_str().to_string(),
                 connected: st.connected,
                 explicitly_disconnected: st.explicitly_disconnected,
+                shell: d.console.shell.clone(),
+                prompt: d.console.prompt.clone(),
+                newline: d.console.newline.clone(),
             }
         })
         .collect();
@@ -726,7 +777,7 @@ pub async fn disconnect_device(
         .await
         .map_err(ctrl_io_to_proto)?;
     let device_connected = device.state.lock().connected;
-    let mut info = device_info_from(&device.config.lock(), device_connected);
+    let mut info = device_info_from(&device.config.lock(), device_connected, &device.console);
     info.id = Some(device.id.clone());
     Ok(serde_json::to_value(DisconnectDeviceResult { device: info }).unwrap())
 }
@@ -748,7 +799,7 @@ pub async fn connect_device(
     tokio::pin!(waiter);
     let _ = tokio::time::timeout(std::time::Duration::from_millis(2000), waiter).await;
     let device_connected = device.state.lock().connected;
-    let mut info = device_info_from(&device.config.lock(), device_connected);
+    let mut info = device_info_from(&device.config.lock(), device_connected, &device.console);
     info.id = Some(device.id.clone());
     Ok(serde_json::to_value(ConnectDeviceResult {
         device: info,
@@ -792,21 +843,42 @@ fn check_session(
     Ok(session)
 }
 
+/// Acquire (or re-enter) the device's writer lock for `session_id`.
+///
+/// `exclusive` marks the kind of hold being requested: `run` always passes
+/// `false` (a transient hold that only serialises against other
+/// `run`/`lock` callers, released by `LockGuard` when the transaction ends);
+/// the `lock` RPC passes `true` (a hold that also gates plain `send` — see
+/// `reject_if_exclusively_locked`) and is released only by `unlock` or
+/// teardown. Re-entering an existing hold never downgrades it from exclusive
+/// to non-exclusive, but does upgrade a non-exclusive hold to exclusive if
+/// the caller asked for one — so a session already inside a `run` can `lock`
+/// the same device without racing itself.
 async fn acquire_lock(
-    device: &crate::state::Device,
+    lock: &crate::state::WriterLock,
     session_id: &str,
     preempt: &str,
+    exclusive: bool,
 ) -> Result<(), ProtocolError> {
     loop {
         {
-            let mut h = device.lock.holder.lock();
-            if h.is_none() {
-                *h = Some(session_id.to_string());
-                return Ok(());
-            }
-            // Re-entry by the same session is allowed.
-            if h.as_deref() == Some(session_id) {
-                return Ok(());
+            let mut h = lock.holder.lock();
+            match h.as_mut() {
+                None => {
+                    *h = Some(crate::state::LockHold {
+                        session_id: session_id.to_string(),
+                        exclusive,
+                    });
+                    return Ok(());
+                }
+                // Re-entry by the same session is allowed.
+                Some(hold) if hold.session_id == session_id => {
+                    if exclusive {
+                        hold.exclusive = true;
+                    }
+                    return Ok(());
+                }
+                Some(_) => {}
             }
         }
         match preempt {
@@ -814,29 +886,122 @@ async fn acquire_lock(
             "force" => {
                 // v0.3 will track outstanding tasks so we can really abort the
                 // current holder. For now we simply swap the holder.
-                let mut h = device.lock.holder.lock();
-                *h = Some(session_id.to_string());
+                let mut h = lock.holder.lock();
+                *h = Some(crate::state::LockHold {
+                    session_id: session_id.to_string(),
+                    exclusive,
+                });
                 return Ok(());
             }
             _ => {
                 // queue — wait for the next release notification.
-                device.lock.released.notified().await;
+                lock.released.notified().await;
             }
         }
     }
 }
 
+/// Releases `run`'s transient writer-lock hold when its transaction ends.
+/// On drop, only clears the holder if it's still (a) this session and (b)
+/// still non-exclusive — if an explicit `lock` upgraded the hold to
+/// exclusive (whether that happened before `run` started or while it was in
+/// flight), the guard steps aside and leaves the release to `unlock` /
+/// teardown instead of severing whatever the exclusive holder was doing.
 struct LockGuard {
-    device: std::sync::Arc<crate::state::Device>,
+    lock: std::sync::Arc<crate::state::WriterLock>,
     session_id: String,
 }
 impl Drop for LockGuard {
     fn drop(&mut self) {
-        let mut h = self.device.lock.holder.lock();
-        if h.as_deref() == Some(self.session_id.as_str()) {
-            *h = None;
-            self.device.lock.released.notify_waiters();
+        release_transient_hold(&self.lock, &self.session_id);
+    }
+}
+
+/// The pure state transition behind `LockGuard::drop`, pulled out so it can
+/// be unit-tested without spinning up a `Device`: release the hold iff it's
+/// still (a) this session and (b) still non-exclusive.
+fn release_transient_hold(lock: &crate::state::WriterLock, session_id: &str) {
+    let mut h = lock.holder.lock();
+    let ours_and_transient = matches!(
+        h.as_ref(),
+        Some(hold) if hold.session_id == session_id && !hold.exclusive
+    );
+    if ours_and_transient {
+        *h = None;
+        lock.released.notify_waiters();
+    }
+}
+
+/// Resolve the device a `lock`/`unlock` call targets. The lock is keyed by
+/// session (not connection), so the device always comes from the session's
+/// binding; an explicit `device_id` is accepted only as a consistency check
+/// against that binding, guarding against a caller that mixed up sessions
+/// across devices.
+fn resolve_locked_device(
+    state: &DaemonState,
+    session_id: &str,
+    device_id: Option<&str>,
+) -> Result<std::sync::Arc<crate::state::Device>, ProtocolError> {
+    let device = state.device_for_session(session_id)?;
+    if let Some(id) = device_id {
+        if id != device.id {
+            return Err(err_with(
+                ErrorCode::DeviceNotFound,
+                format!("session bound to device {:?}, not {id:?}", device.id),
+            ));
         }
+    }
+    Ok(device)
+}
+
+/// Reject a raw write when the device's writer lock is held *exclusively* by
+/// a different session (taken via `lock` — typically flashing). `run`'s own
+/// internal hold is never exclusive, so a plain `run` in progress doesn't
+/// trigger this; it already serialises against other `run`/`lock` callers
+/// through `acquire_lock`'s queueing.
+fn reject_if_exclusively_locked(
+    lock: &crate::state::WriterLock,
+    session_id: &str,
+) -> Result<(), ProtocolError> {
+    let h = lock.holder.lock();
+    if let Some(hold) = h.as_ref() {
+        if hold.exclusive && hold.session_id != session_id {
+            return Err(err_with(
+                ErrorCode::LockContention,
+                "device locked by another session (flashing?); try again after unlock",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Release the device's writer lock if `session_id` is the current holder.
+/// Idempotent when nobody holds it; refuses (`LockContention`) to release a
+/// lock a *different* session holds.
+fn release_lock_if_holder(
+    lock: &crate::state::WriterLock,
+    session_id: &str,
+) -> Result<(), ProtocolError> {
+    let mut h = lock.holder.lock();
+    match h.as_ref() {
+        None => Ok(()),
+        Some(hold) if hold.session_id == session_id => {
+            *h = None;
+            lock.released.notify_waiters();
+            Ok(())
+        }
+        Some(_) => Err(err_with(ErrorCode::LockContention, "not the lock holder")),
+    }
+}
+
+/// Best-effort lock release at teardown (session `detach`, connection
+/// close): if `session_id` held the device's writer lock, free it so it
+/// doesn't outlive the session with no way to `unlock` it. Silently does
+/// nothing if the session never held a lock, already released it, or its
+/// device can't be resolved (e.g. already removed).
+pub(crate) fn release_lock_for_session(state: &DaemonState, session_id: &str) {
+    if let Ok(device) = state.device_for_session(session_id) {
+        let _ = release_lock_if_holder(&device.lock, session_id);
     }
 }
 
@@ -1049,5 +1214,153 @@ mod tests {
     fn ansi_strip_basic() {
         let s = b"\x1b[31mred\x1b[0m text";
         assert_eq!(strip_ansi_bytes(s), b"red text");
+    }
+
+    // ---------- Writer-lock state transitions ----------
+    //
+    // These exercise `acquire_lock` / `release_transient_hold` /
+    // `reject_if_exclusively_locked` / `release_lock_if_holder` directly
+    // against a bare `WriterLock`, without needing a full `Device`.
+
+    use crate::state::{LockHold, WriterLock};
+
+    #[tokio::test]
+    async fn acquire_lock_reentry_never_downgrades_exclusive() {
+        let lock = WriterLock::default();
+
+        // Fresh, non-exclusive acquire (like `run`).
+        acquire_lock(&lock, "s1", "queue", false).await.unwrap();
+        assert!(!lock.holder.lock().as_ref().unwrap().exclusive);
+
+        // Same session re-enters non-exclusively: still non-exclusive.
+        acquire_lock(&lock, "s1", "queue", false).await.unwrap();
+        assert!(!lock.holder.lock().as_ref().unwrap().exclusive);
+
+        // Same session upgrades to exclusive (like `lock` while a `run` is
+        // already holding the lock).
+        acquire_lock(&lock, "s1", "queue", true).await.unwrap();
+        assert!(lock.holder.lock().as_ref().unwrap().exclusive);
+
+        // A later non-exclusive re-entry (another `run`) must not downgrade it.
+        acquire_lock(&lock, "s1", "queue", false).await.unwrap();
+        assert!(lock.holder.lock().as_ref().unwrap().exclusive);
+    }
+
+    #[tokio::test]
+    async fn acquire_lock_fail_preempt_reports_contention() {
+        let lock = WriterLock::default();
+        acquire_lock(&lock, "s1", "queue", false).await.unwrap();
+
+        let err = acquire_lock(&lock, "s2", "fail", true).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::LockContention.as_i32());
+    }
+
+    #[tokio::test]
+    async fn acquire_lock_force_preempt_swaps_holder() {
+        let lock = WriterLock::default();
+        acquire_lock(&lock, "s1", "queue", false).await.unwrap();
+
+        acquire_lock(&lock, "s2", "force", true).await.unwrap();
+        let holder = lock.holder.lock().clone().unwrap();
+        assert_eq!(holder.session_id, "s2");
+        assert!(holder.exclusive);
+    }
+
+    #[tokio::test]
+    async fn acquire_lock_queue_waits_for_release() {
+        let lock = std::sync::Arc::new(WriterLock::default());
+        acquire_lock(&lock, "s1", "queue", false).await.unwrap();
+
+        let waiter_lock = lock.clone();
+        let waiter = tokio::spawn(async move {
+            acquire_lock(&waiter_lock, "s2", "queue", true).await
+        });
+
+        // Give the waiter a chance to park on `released` before we release.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        release_lock_if_holder(&lock, "s1").unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("waiter should complete once released")
+            .unwrap()
+            .unwrap();
+        let holder = lock.holder.lock().clone().unwrap();
+        assert_eq!(holder.session_id, "s2");
+        assert!(holder.exclusive);
+    }
+
+    #[test]
+    fn release_transient_hold_clears_own_non_exclusive_hold() {
+        let lock = WriterLock::default();
+        *lock.holder.lock() = Some(LockHold { session_id: "s1".into(), exclusive: false });
+        release_transient_hold(&lock, "s1");
+        assert!(lock.holder.lock().is_none());
+    }
+
+    #[test]
+    fn release_transient_hold_leaves_exclusive_hold_alone() {
+        // An explicit `lock` upgraded the hold while `run` was in flight (or
+        // held it before `run` even started) — `run`'s guard must not clear it.
+        let lock = WriterLock::default();
+        *lock.holder.lock() = Some(LockHold { session_id: "s1".into(), exclusive: true });
+        release_transient_hold(&lock, "s1");
+        assert!(lock.holder.lock().is_some());
+    }
+
+    #[test]
+    fn release_transient_hold_ignores_other_sessions() {
+        let lock = WriterLock::default();
+        *lock.holder.lock() = Some(LockHold { session_id: "s2".into(), exclusive: false });
+        release_transient_hold(&lock, "s1");
+        assert!(lock.holder.lock().is_some());
+    }
+
+    #[test]
+    fn reject_if_exclusively_locked_allows_free_and_non_exclusive() {
+        let lock = WriterLock::default();
+        assert!(reject_if_exclusively_locked(&lock, "s1").is_ok());
+
+        *lock.holder.lock() = Some(LockHold { session_id: "s2".into(), exclusive: false });
+        assert!(reject_if_exclusively_locked(&lock, "s1").is_ok());
+    }
+
+    #[test]
+    fn reject_if_exclusively_locked_allows_own_exclusive_hold() {
+        let lock = WriterLock::default();
+        *lock.holder.lock() = Some(LockHold { session_id: "s1".into(), exclusive: true });
+        assert!(reject_if_exclusively_locked(&lock, "s1").is_ok());
+    }
+
+    #[test]
+    fn reject_if_exclusively_locked_blocks_other_sessions_send() {
+        let lock = WriterLock::default();
+        *lock.holder.lock() = Some(LockHold { session_id: "s2".into(), exclusive: true });
+        let err = reject_if_exclusively_locked(&lock, "s1").unwrap_err();
+        assert_eq!(err.code, ErrorCode::LockContention.as_i32());
+    }
+
+    #[test]
+    fn release_lock_if_holder_is_idempotent_when_free() {
+        let lock = WriterLock::default();
+        assert!(release_lock_if_holder(&lock, "s1").is_ok());
+    }
+
+    #[test]
+    fn release_lock_if_holder_releases_own_hold() {
+        let lock = WriterLock::default();
+        *lock.holder.lock() = Some(LockHold { session_id: "s1".into(), exclusive: true });
+        release_lock_if_holder(&lock, "s1").unwrap();
+        assert!(lock.holder.lock().is_none());
+    }
+
+    #[test]
+    fn release_lock_if_holder_refuses_other_sessions() {
+        let lock = WriterLock::default();
+        *lock.holder.lock() = Some(LockHold { session_id: "s2".into(), exclusive: true });
+        let err = release_lock_if_holder(&lock, "s1").unwrap_err();
+        assert_eq!(err.code, ErrorCode::LockContention.as_i32());
+        // Left untouched — still held by s2.
+        assert_eq!(lock.holder.lock().as_ref().unwrap().session_id, "s2");
     }
 }

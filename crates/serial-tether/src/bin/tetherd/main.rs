@@ -91,6 +91,15 @@ struct Args {
     ///   modem lines or real baud, so DTR/RTS auto-reset and mid-stream baud
     ///   changes are not forwarded (console sharing and out-of-band-reset
     ///   flashing work).
+    ///
+    ///   `-D board=/dev/ttyUSB0,shell=uboot,prompt='=> ',newline=cr` — console
+    ///   personality. `shell=posix|uboot|none` (default posix): `uboot` makes
+    ///   `exec`/`run` use CR-only framing (CRLF double-executes U-Boot's CLI)
+    ///   and defaults `newline=cr`; `none` makes `exec` refuse (raw console —
+    ///   use run/send/expect). `prompt=<regex>` becomes the default `-u` for
+    ///   `run`/`sync`. `newline=lf|cr|crlf|none` sets the default line
+    ///   terminator. These are reported in `tether list-devices`/`status`.
+    ///   (Comma-delimited, so a `prompt=` regex must not contain a comma.)
     #[arg(
         short = 'D',
         long = "device",
@@ -202,6 +211,11 @@ struct DeviceSpec {
     /// `pty=<link>` exposes a virtual serial port for this device at `<link>`.
     /// `Some("")` (bare `pty`) means "use the default path" (`/tmp/tether-<id>.pty`).
     pty: Option<String>,
+    /// Console personality: `shell=posix|uboot|none`, `prompt=<regex>`,
+    /// `newline=lf|cr|crlf|none`. All optional; see `ConsolePersonality`.
+    shell: Option<String>,
+    prompt: Option<String>,
+    newline: Option<String>,
 }
 
 /// Parse one `-D` argument. Forms:
@@ -212,7 +226,13 @@ struct DeviceSpec {
 ///   `path,key=value,key=value,...`        (id derived from path)
 ///
 /// Recognised keys: `baud`, `data-bits` (or `data_bits`), `parity`,
-/// `stop-bits` (or `stop_bits`), `flow` (or `flow-control` / `flow_control`).
+/// `stop-bits` (or `stop_bits`), `flow` (or `flow-control` / `flow_control`),
+/// `pty`, and the console-personality keys `shell` (`posix`|`uboot`|`none`),
+/// `prompt` (a `-u` regex for `run`/`sync`), and `newline`
+/// (`lf`|`cr`|`crlf`|`none`).
+///
+/// Note: values are comma-delimited, so a `prompt=` regex must not contain a
+/// literal comma.
 fn parse_device_spec(s: &str) -> anyhow::Result<DeviceSpec> {
     let mut parts = s.split(',');
     let head = parts
@@ -240,6 +260,9 @@ fn parse_device_spec(s: &str) -> anyhow::Result<DeviceSpec> {
         stop_bits: None,
         flow_control: None,
         pty: None,
+        shell: None,
+        prompt: None,
+        newline: None,
     };
 
     for kv in parts {
@@ -275,6 +298,30 @@ fn parse_device_spec(s: &str) -> anyhow::Result<DeviceSpec> {
                 spec.flow_control = Some(v.to_string());
             }
             "pty" | "pty-link" => spec.pty = Some(v.to_string()),
+            "shell" => {
+                let v = v.trim();
+                if !matches!(v, "posix" | "uboot" | "none") {
+                    anyhow::bail!(
+                        "invalid shell {v:?} in -D spec (want posix|uboot|none)"
+                    );
+                }
+                spec.shell = Some(v.to_string());
+            }
+            "prompt" => {
+                if v.is_empty() {
+                    anyhow::bail!("empty prompt in -D spec {s:?}");
+                }
+                spec.prompt = Some(v.to_string());
+            }
+            "newline" | "eol" => {
+                let v = v.trim();
+                if !matches!(v, "lf" | "cr" | "crlf" | "none") {
+                    anyhow::bail!(
+                        "invalid newline {v:?} in -D spec (want lf|cr|crlf|none)"
+                    );
+                }
+                spec.newline = Some(v.to_string());
+            }
             other => anyhow::bail!("unknown key {other:?} in -D spec {s:?}"),
         }
     }
@@ -559,6 +606,23 @@ async fn main() -> Result<()> {
         );
         serial_tasks.push(task);
 
+        // Console personality. `uboot` forces a CR-only line terminator (its
+        // CLI runs a command per CR and repeats the last command on a bare LF,
+        // so CRLF double-executes) unless the operator overrode `newline`.
+        let shell = spec.shell.clone().unwrap_or_else(|| "posix".into());
+        let newline = spec.newline.clone().or_else(|| {
+            if shell == "uboot" {
+                Some("cr".into())
+            } else {
+                None
+            }
+        });
+        let console = crate::state::ConsolePersonality {
+            shell,
+            prompt: spec.prompt.clone(),
+            newline,
+        };
+
         let device = Arc::new(crate::state::Device {
             id: spec.id.clone(),
             buffer,
@@ -570,6 +634,7 @@ async fn main() -> Result<()> {
             reconnected,
             events: events_tx,
             lock: Arc::new(crate::state::WriterLock::default()),
+            console,
         });
 
         // Optional virtual serial port (PTY) so non-tether tools can share
@@ -585,6 +650,7 @@ async fn main() -> Result<()> {
                 link.clone(),
                 device.buffer.clone(),
                 device.writer.clone(),
+                device.lock.clone(),
             ) {
                 Ok(()) => println!("virtual port: {} -> {}", spec.id, link),
                 Err(e) => tracing::warn!(
