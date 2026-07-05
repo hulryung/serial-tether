@@ -8,6 +8,10 @@ also apply.
 
 ## [Unreleased]
 
+(Nothing yet.)
+
+## [0.11.0] — 2026-07-05
+
 ### Added
 - **Per-device console personality (`shell=` / `prompt=` / `newline=`).**
   Register what's on the other end of the wire once, in the `-D` spec:
